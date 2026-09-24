@@ -18,6 +18,10 @@ using Vector3 = System.Numerics.Vector3; // s&box compat: shadow engine's global
 /// about the skeleton (leg chains point down, hands mirror) is silently wrong and
 /// retargeted motion comes out mangled on exactly the posed bones. Found in the wild on
 /// Auto-Rig Pro exports whose IK'd hands/feet were left posed (one leg at hip height).
+/// Skin clusters record the pose the mesh is actually bound to (<c>TransformLink</c>), and
+/// take precedence: 3ds Max Biped exports can leave node transforms posed with a BindPose
+/// that agrees with them, while the skin was bound in another pose. Their fingers then
+/// tear apart as soon as they move.
 /// </summary>
 public static class FbxBindPoseFixer
 {
@@ -51,9 +55,13 @@ public static class FbxBindPoseFixer
             return null;
         }
 
-        if (scene.BindPose.Count == 0)
+        // The skin bind is authoritative for skinned bones; BindPose covers the rest.
+        var binds = new Dictionary<long, Matrix4x4>(scene.BindPose);
+        foreach (var (id, link) in scene.SkinBind)
+            binds[id] = link;
+        if (binds.Count == 0)
         {
-            report = "no BindPose section";
+            report = "no BindPose section or skin clusters";
             return null;
         }
 
@@ -78,7 +86,7 @@ public static class FbxBindPoseFixer
         int posedCount = 0;
         foreach (var model in order)
         {
-            if (!scene.BindPose.TryGetValue(model.Id, out var bind))
+            if (!binds.TryGetValue(model.Id, out var bind))
                 continue;
             var fk = FbxTransform.ToRigid(originalWorld[model.Id]);
             var target = FbxTransform.ToRigid(bind);
@@ -90,7 +98,7 @@ public static class FbxBindPoseFixer
         }
         if (posedCount == 0)
         {
-            report = $"node transforms match the BindPose ({scene.BindPose.Count} entries)";
+            report = $"node transforms match the bind pose ({binds.Count} entries)";
             return null;
         }
 
@@ -106,7 +114,7 @@ public static class FbxBindPoseFixer
                 ? pw
                 : Matrix4x4.Identity;
 
-            if (!scene.BindPose.TryGetValue(model.Id, out var bindWorld))
+            if (!binds.TryGetValue(model.Id, out var bindWorld))
             {
                 // No bind info: keep the original local under the (possibly corrected) parent.
                 var transform = FbxTransform.FromModel(scene, model);

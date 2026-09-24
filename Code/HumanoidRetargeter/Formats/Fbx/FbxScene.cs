@@ -197,6 +197,11 @@ public sealed class FbxScene
     /// <summary>World-space bind matrices from Pose/BindPose nodes, by model id (row-vector layout).</summary>
     public IReadOnlyDictionary<long, Matrix4x4> BindPose => _bindPose;
 
+    /// <summary>World-space skin bind matrices (skin cluster <c>TransformLink</c>), by linked
+    /// model id (row-vector layout): the pose the mesh is actually bound to. First cluster
+    /// wins when several meshes skin the same bone.</summary>
+    public IReadOnlyDictionary<long, Matrix4x4> SkinBind => _skinBind;
+
     /// <summary>GlobalSettings UnitScaleFactor: source-unit → centimeter factor (FBX default 1 = cm).</summary>
     public double UnitScaleFactor { get; private set; } = 1.0;
 
@@ -263,6 +268,8 @@ public sealed class FbxScene
     private readonly List<FbxObject> _models = new();
     private readonly List<FbxAnimStack> _stacks = new();
     private readonly Dictionary<long, Matrix4x4> _bindPose = new();
+    private readonly Dictionary<long, Matrix4x4> _skinBind = new();
+    private readonly Dictionary<long, Matrix4x4> _clusterLinks = new();
     private readonly Dictionary<string, Dictionary<string, FbxProperty70>> _templates = new();
 
     private FbxScene()
@@ -359,6 +366,10 @@ public sealed class FbxScene
                     if (subClass == "BindPose")
                         ReadBindPose(node);
                     break;
+                case "Deformer":
+                    if (subClass == "Cluster" && node.Child("TransformLink") is { } link && ReadMatrix(link) is { } linkMatrix)
+                        _clusterLinks[id] = linkMatrix;
+                    break;
             }
         }
     }
@@ -372,18 +383,23 @@ public sealed class FbxScene
             if (nodeId is null || matrix is null)
                 continue;
 
-            double[] m = matrix.AsDoubleArray(0);
-            if (m.Length < 16)
-                continue;
-
-            // FBX matrices are stored as 16 doubles with translation in elements 12..14 —
-            // the same memory layout as System.Numerics row-vector matrices.
-            _bindPose[nodeId.Prop<long>(0)] = new Matrix4x4(
-                (float)m[0], (float)m[1], (float)m[2], (float)m[3],
-                (float)m[4], (float)m[5], (float)m[6], (float)m[7],
-                (float)m[8], (float)m[9], (float)m[10], (float)m[11],
-                (float)m[12], (float)m[13], (float)m[14], (float)m[15]);
+            if (ReadMatrix(matrix) is { } bind)
+                _bindPose[nodeId.Prop<long>(0)] = bind;
         }
+    }
+
+    // FBX matrices are stored as 16 doubles with translation in elements 12..14 —
+    // the same memory layout as System.Numerics row-vector matrices.
+    private static Matrix4x4? ReadMatrix(FbxNode matrix)
+    {
+        double[] m = matrix.AsDoubleArray(0);
+        if (m.Length < 16)
+            return null;
+        return new Matrix4x4(
+            (float)m[0], (float)m[1], (float)m[2], (float)m[3],
+            (float)m[4], (float)m[5], (float)m[6], (float)m[7],
+            (float)m[8], (float)m[9], (float)m[10], (float)m[11],
+            (float)m[12], (float)m[13], (float)m[14], (float)m[15]);
     }
 
     private static IReadOnlyDictionary<string, FbxProperty70> ReadProperties70(FbxNode node)
@@ -485,6 +501,9 @@ public sealed class FbxScene
 
             if (kind == "OO")
             {
+                // A bone model is linked to its skin cluster by Model→Deformer(Cluster).
+                if (src.NodeType == "Model" && dst is not null && _clusterLinks.TryGetValue(dstId, out var link))
+                    _skinBind.TryAdd(srcId, link);
                 if (src.NodeType == "Model" && dst?.NodeType == "Model")
                 {
                     if (src.ModelParent is null) // first parent wins on instancing
