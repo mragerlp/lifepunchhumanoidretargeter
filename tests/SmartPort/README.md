@@ -65,3 +65,15 @@ The Smart Port checkbox preserves the target's existing setup as the default and
 The output's `<name>_smart_port/clips.txt` lists clip IDs. Set `renderer.Set("hr_smartport_clip", id)` to select one, or `0` to return to the original graph. The guide gives the actual parameter name if that name was already used. Non-looping clips hold their final frame until reset to `0`; reset before replaying the same clip. Local additive clips layer over the existing output. Hidden/world-space clips remain in ModelDoc for manual graph editing.
 
 `SmartPortExtensionTests.cs` covers arbitrary graph preservation, default routing, ID/name collisions, additive layers, events and masks. `Engine/SmartPortExtendEngineTest.cs` uses the same isolated project/fixtures as the different-armature test, plus the target's existing graph and its dependencies. Enable only `HR_SMART_PORT_EXTEND_TEST_PROJECT`. It creates a new extended model, checks both animation libraries, walks/runs in play mode, selects an imported pose, returns to the original graph and tests a zero-additive layer. Results are written to `smart-port-extend-result.json`.
+
+## Weapons stay in the hands on every rig profile
+
+Simple Weapon Base and the stock weapons parent the weapon to the `hold_R` bone object with an identity offset and never scale it. `SmartPortWeaponGripTests.cs` builds targets with other bone-axis conventions, larger hands than legs, a different rest wrist angle and other body sizes, then checks:
+
+- A copied `hold_R` keeps the source's model-space axes (the weapon aims the same way), and the fitted hand's palm is turned to match the source's, so the weapon lies in the palm like the source's. Its offset from the knuckles scales with the hand, not the legs.
+- Cross-hand support goals (Citizen's `hand_L_to_R_ikrule`, used only by holdtype compositing) keep the support hand's grip where the source's is on the weapon, in unscaled weapon units. This applies to copied sockets and goals, and to a target's own existing ones. Target binds are unchanged and zero additive deltas stay zero.
+- `FittedCitizenPose` (Create Citizen animation model on a fitted Citizen armature) applies the same weapon-rigid support goals.
+
+- The reach fit keeps the source's support-arm slack at body scale. Locomotion layers move the shoulders under a held weapon at body scale, so an arm that is only proportionally as bent as the source's can still run out of reach while walking.
+
+Measured in play mode on Citizen Smart Ported onto Mixamo, UE Mannequin, 3ds Max Biped, Advanced Skeleton and two auto-mapped rigs, holding the Simple Weapon Base Colt, SCAR-H and Remington at idle/walk/run while firing: the weapon sits within 0.12 units and 0.3 degrees of Citizen's palm grip and the support grip within 0.08 units. The pre-change port missed by up to 5.9 units and 16 degrees at the grip and 45 units at the support hand. One cartoon rig whose arms are about half Citizen's arm-to-body proportion cannot reach a full-size rifle or shotgun fore-end while walking: its support goal is on the weapon, but its fully extended arm stops about 1.3 units short. The weapon is never scaled to compensate.

@@ -1,5 +1,7 @@
 #nullable enable annotations
 using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Numerics;
 using HumanoidRetargeter.Maths;
 using SkeletonModel = HumanoidRetargeter.Skeleton.Skeleton;
@@ -15,6 +17,8 @@ public sealed class FittedCitizenPose
     private readonly int[] indices;
     private readonly Quaternion[] parentBasis;
     private readonly float[] translationScale;
+    // Two-handed hold goals: (goal, weapon socket on the anchor hand, support hand, support hand's socket).
+    private readonly List<(int Goal, int Anchor, int Hand, int Grip)> supportGoals = new();
 
     public FittedCitizenPose(SkeletonModel source, SkeletonModel target)
     {
@@ -49,6 +53,15 @@ public sealed class FittedCitizenPose
             var length = source[s].RestLocal.Pos.Length();
             translationScale[i] = sp < 0 || length < 0.0001f ? rootScale : target[i].RestLocal.Pos.Length() / length;
         }
+        // The Citizen graph pins the support hand to these goals while an item is held. Weapons
+        // are never scaled with the character, so the grip separation must not be either.
+        foreach (var (goal, anchor, hand, grip) in new[] { ("hand_L_to_R_ikrule", "hold_R", "hand_L", "hold_L"),
+            ("hand_R_to_L_ikrule", "hold_L", "hand_R", "hold_R") })
+        {
+            var names = new[] { goal, anchor, hand, grip };
+            if (names.Any(n => source.IndexOf(n) < 0 || target.IndexOf(n) < 0) || target[target.IndexOf(goal)].ParentIndex < 0) continue;
+            supportGoals.Add((target.IndexOf(goal), target.IndexOf(anchor), target.IndexOf(hand), target.IndexOf(grip)));
+        }
     }
 
     /// <summary>Rest maps to rest; rotation deltas retain their model-space axes, and local lengths stay fitted.</summary>
@@ -68,6 +81,28 @@ public sealed class FittedCitizenPose
             var position = bind.Pos + NVector3.Transform(frame[s].Pos - original.Pos, basis) * translationScale[i];
             output[i] = new XForm(position, rotation);
         }
+        if (supportGoals.Count == 0) return output;
+        var sourceWorld = World(source, frame);
+        var targetWorld = World(target, output);
+        foreach (var (goal, anchor, hand, grip) in supportGoals)
+        {
+            // Where the source's support grip sits on the weapon when its wrist is on the goal.
+            var sourceGrip = XForm.Compose(sourceWorld[indices[goal]],
+                XForm.ToLocal(sourceWorld[indices[hand]], sourceWorld[indices[grip]])).Pos;
+            var onWeapon = sourceWorld[indices[anchor]].Inverse().TransformPoint(sourceGrip);
+            var rotation = targetWorld[goal].Rot;
+            var reach = XForm.ToLocal(targetWorld[hand], targetWorld[grip]).Pos;
+            var place = new XForm(targetWorld[anchor].TransformPoint(onWeapon) - NVector3.Transform(reach, rotation), rotation);
+            output[goal] = XForm.ToLocal(targetWorld[target[goal].ParentIndex], place);
+        }
         return output;
+    }
+
+    private static XForm[] World(SkeletonModel skeleton, XForm[] pose)
+    {
+        var world = new XForm[skeleton.Count];
+        foreach (var bone in skeleton.Bones)
+            world[bone.Index] = bone.ParentIndex < 0 ? pose[bone.Index] : XForm.Compose(world[bone.ParentIndex], pose[bone.Index]);
+        return world;
     }
 }
