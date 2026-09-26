@@ -1062,16 +1062,20 @@ public static class Retargeter
         up = GroundUp(up);
         var worlds = new XForm[frames.Count][];
         var restGround = float.PositiveInfinity;
-        var motionGround = float.PositiveInfinity;
+        var frameGrounds = new List<float>(frames.Count);
         foreach (var rest in source.RestWorld)
             restGround = MathF.Min(restGround, Vector3.Dot(rest.Pos, srcUp));
         for (var f = 0; f < frames.Count; f++)
         {
             worlds[f] = new Skeleton.Pose(srcFrames[f]).ToWorld(source);
+            var low = float.PositiveInfinity;
             foreach (var bone in worlds[f])
-                motionGround = MathF.Min(motionGround, Vector3.Dot(bone.Pos, srcUp));
+                low = MathF.Min(low, Vector3.Dot(bone.Pos, srcUp));
+            frameGrounds.Add(low);
         }
-        var placement = scene.RestPlacementAuthored ? 0f : motionGround - restGround;
+        // The capture floor, robust to brief marker dips (see AlignSupportToGround): an
+        // absolute minimum from a glitch frame lifted every real plant by the dip depth.
+        var placement = scene.RestPlacementAuthored ? 0f : GroundLevel(frameGrounds, robust: true, scene.Clips[take].Fps) - restGround;
         var corrections = new List<(FootChain Chain, Vector3[] Goals)>();
         var lowerPelvis = new float[frames.Count];
         foreach (var (footRole, toeRole, chain) in new[]
@@ -1479,13 +1483,22 @@ public static class Retargeter
         foreach (var b in tgtSupportBones)
             tgtRestSupport = MathF.Min(tgtRestSupport, Vector3.Dot(rest[b].Pos, up));
 
-        var solvedSupport = float.MaxValue;
+        // Un-placed captures (BVH) carry marker noise: a toe dipping through the floor for a
+        // handful of frames set the clip minimum, and every real footplant then floated by
+        // the dip depth (CMU 01_01: 4 of 688 frames sat ~2 in below all its plants). Those
+        // sources measure the ground robustly (see GroundLevel) instead of the absolute
+        // minimum; authored placements keep the exact minimum.
+        var robust = !scene.RestPlacementAuthored;
+        var solvedLows = new List<float>(frames.Count);
         foreach (var frame in frames)
         {
             var world = new Skeleton.Pose(frame).ToWorld(skeleton);
+            var low = float.MaxValue;
             foreach (var b in tgtSupportBones)
-                solvedSupport = MathF.Min(solvedSupport, Vector3.Dot(world[b].Pos, up));
+                low = MathF.Min(low, Vector3.Dot(world[b].Pos, up));
+            solvedLows.Add(low);
         }
+        var solvedSupport = GroundLevel(solvedLows, robust, srcClip.Fps);
 
         // ---- source-authored support gap --------------------------------------
         float sourceRel = 0f;
@@ -1513,19 +1526,25 @@ public static class Retargeter
             foreach (var b in srcSupportBones)
                 srcRestSupport = MathF.Min(srcRestSupport, Vector3.Dot(src.RestWorld[b].Pos, srcUp));
 
-            var srcClipSupport = float.MaxValue;
-            var srcMotionGround = float.MaxValue;
+            var srcSupportLows = new List<float>(srcClip.Frames.Count);
+            var srcGroundLows = new List<float>(srcClip.Frames.Count);
             foreach (var frame in srcClip.Frames)
             {
                 var world = new Skeleton.Pose(frame).ToWorld(src);
+                var low = float.MaxValue;
                 foreach (var b in srcSupportBones)
-                    srcClipSupport = MathF.Min(srcClipSupport, Vector3.Dot(world[b].Pos, srcUp));
+                    low = MathF.Min(low, Vector3.Dot(world[b].Pos, srcUp));
+                srcSupportLows.Add(low);
                 if (!scene.RestPlacementAuthored)
                 {
+                    var ground = float.MaxValue;
                     for (var b = 0; b < src.Count; b++)
-                        srcMotionGround = MathF.Min(srcMotionGround, Vector3.Dot(world[b].Pos, srcUp));
+                        ground = MathF.Min(ground, Vector3.Dot(world[b].Pos, srcUp));
+                    srcGroundLows.Add(ground);
                 }
             }
+            var srcClipSupport = GroundLevel(srcSupportLows, robust, srcClip.Fps);
+            var srcMotionGround = srcGroundLows.Count > 0 ? GroundLevel(srcGroundLows, robust, srcClip.Fps) : float.MaxValue;
 
             // AUTHORED placements (FBX): the rest stands on the authored ground, so the
             // gap is simply clip support minus rest support (same bones, same space).
@@ -1576,6 +1595,30 @@ public static class Retargeter
               + $"(source-authored support delta {sourceRel:0.00})."
             : $"Support ground alignment: {delta:0.00} vertical offset applied "
               + "(source feet unmapped; clip support aligned to target rest support).");
+    }
+
+    /// <summary>The clip's ground level from its per-frame lowest heights: the exact
+    /// minimum, or with <paramref name="robust"/> the 10th percentile of the one-second
+    /// window minima. An isolated capture glitch (one window of many) is ignored, while
+    /// a dip that recurs through the clip, or any dip in a short clip, stays the ground.</summary>
+    private static float GroundLevel(List<float> lows, bool robust, float fps)
+    {
+        var min = float.MaxValue;
+        foreach (var l in lows)
+            min = MathF.Min(min, l);
+        var window = Math.Max(1, (int)MathF.Round(fps > 0f ? fps : 30f));
+        if (!robust || lows.Count < window * 10)
+            return min;
+        var minima = new List<float>();
+        for (var start = 0; start < lows.Count; start += window)
+        {
+            var low = float.MaxValue;
+            for (var f = start; f < Math.Min(start + window, lows.Count); f++)
+                low = MathF.Min(low, lows[f]);
+            minima.Add(low);
+        }
+        minima.Sort();
+        return minima[(int)((minima.Count - 1) * 0.1f)];
     }
 
     private static Vector3 GroundUp(Vector3 up)
