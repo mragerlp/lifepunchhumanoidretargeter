@@ -1743,6 +1743,12 @@ public static class EditorPipeline
 
 		// ---- 3. settle, then compile ONCE (retry on abandoned recompile: one normally,
 		// two for install-resident projects - see the policy comment above) ---------------
+		// A model built on a base model compiles its clips against the base's skeleton: when the
+		// base isn't loaded yet (the first such compile of an editor session) the engine drops
+		// every clip's animation data without an error. Load it first.
+		var baseModel = BaseModelOf( result.VmdlPath );
+		if ( !string.IsNullOrEmpty( baseModel ) )
+			Try( () => Model.Load( baseModel ) );
 		await Task.Delay( settleDelayMs );
 
 		var vmdlFileName = Path.GetFileName( result.VmdlPath );
@@ -1764,6 +1770,19 @@ public static class EditorPipeline
 				watchFileName: vmdlFileName );
 		}
 
+		// The same drop can still happen: when the clips came out in the bind pose, compile again.
+		if ( result.Compiled && !await ClipsPoseAsync( result.VmdlAsset.Path, successful.Select( c => c.ClipName ).ToList() ) )
+		{
+			Log.Warning( $"[humanoid-retargeter] {vmdlFileName} compiled without its animation data - compiling again" );
+			await SwitchToMainThread();
+			logOffset = SboxLogLength();
+			result.Compiled = await CompileAndWaitAsync( result.VmdlAsset,
+				timeoutSeconds: compileTimeoutSeconds, logOffset: logOffset,
+				watchFileName: vmdlFileName );
+			if ( result.Compiled && !await ClipsPoseAsync( result.VmdlAsset.Path, successful.Select( c => c.ClipName ).ToList() ) )
+				result.Errors.Add( $"{vmdlFileName} compiled, but its animations play the bind pose. Compile it again from the asset browser." );
+		}
+
 		await SwitchToMainThread();
 		result.CompiledFile = Try( () => result.VmdlAsset.GetCompiledFile( true ) );
 		if ( !result.Compiled )
@@ -1777,6 +1796,64 @@ public static class EditorPipeline
 		}
 
 		return result;
+	}
+
+	/// <summary>The vmdl's base_model_name, or null.</summary>
+	static string BaseModelOf( string vmdlPath )
+	{
+		try
+		{
+			var match = System.Text.RegularExpressions.Regex.Match( File.ReadAllText( vmdlPath ), @"base_model_name\s*=\s*""([^""]*)""" );
+			return match.Success ? match.Groups[1].Value : null;
+		}
+		catch
+		{
+			return null;
+		}
+	}
+
+	/// <summary>
+	/// Whether the compiled model's clips pose the character (a compile that dropped the animation
+	/// data leaves every clip in the bind pose). Clips the model doesn't list are skipped.
+	/// </summary>
+	static async Task<bool> ClipsPoseAsync( string modelPath, IReadOnlyList<string> clips )
+	{
+		await SwitchToMainThread();
+		Model model = null;
+		for ( var i = 0; i < 40 && (model is null || model.IsError || !clips.Any( model.AnimationNames.Contains )); i++ )
+		{
+			model = Model.Load( modelPath );
+			if ( model is null || model.IsError || !clips.Any( model.AnimationNames.Contains ) )
+				await Task.Delay( 250 );
+		}
+		if ( model is null || model.IsError || model.BoneCount == 0 )
+			return true;
+		var names = clips.Where( model.AnimationNames.Contains ).ToList();
+		if ( names.Count == 0 )
+			return true;
+		var world = new SceneWorld();
+		var scene = new SceneModel( world, model, Transform.Zero ) { UseAnimGraph = false };
+		try
+		{
+			foreach ( var name in names )
+			{
+				scene.CurrentSequence.Name = name;
+				foreach ( var t in new[] { 0f, 0.5f } )
+				{
+					scene.CurrentSequence.TimeNormalized = t;
+					scene.Update( 0.001f );
+					for ( var b = 0; b < model.BoneCount; b++ )
+						if ( scene.GetBoneWorldTransform( b ).Position.Distance( model.GetBoneTransform( b ).Position ) > 0.5f )
+							return true;
+				}
+			}
+			return false;
+		}
+		finally
+		{
+			scene.Delete();
+			world.Delete();
+		}
 	}
 
 	// ---- compile-error capture --------------------------------------------------------
