@@ -2,6 +2,7 @@
 
 using System;
 using Editor;
+using Sandbox;
 
 namespace HumanoidRetargeter.Editor;
 
@@ -36,58 +37,40 @@ public sealed class NoProfileDialog : Dialog
 		Window.WindowTitle = "No known profile";
 		Window.SetWindowIcon( "person_search" );
 		Window.SetModal( true, true );
-		Window.MinimumWidth = 480;
+		Window.MinimumWidth = 660;
 
 		Layout = Layout.Column();
-		Layout.Margin = 20;
-		Layout.Spacing = 12;
+		Layout.Margin = 10;
+		Layout.Spacing = 8;
 
-		var header = Layout.AddRow();
-		header.Spacing = 12;
-		var icon = header.Add( new Label( this ) { Text = "help_outline" } );
-		icon.SetStyles( $"font-family: Material Icons; font-size: 34px; color: {Theme.Yellow.Hex};" );
-		var headColumn = header.AddColumn( 1 );
-		headColumn.Add( new Label.Subtitle( "No known profile found for this rig" ) );
-		headColumn.Add( new Label( this )
+		var card = Layout.Add( new RtCard( this ) );
+		var header = card.Header( "person_search", "No known profile for this rig" );
+		header.AddStretchCell();
+		header.Add( new RtPill( card, $"AUTO {autoConfidence * 100f:0}%", autoConfidence >= 0.75f ? Theme.Green : autoConfidence >= 0.45f ? Theme.Yellow : Theme.Red,
+			"How sure the automatic mapper is about its best-effort mapping" ) );
+		card.Layout.Add( RtStyle.Muted( new Label( this )
 		{
-			Text = $"\"{fileName}\" does not match any preset bone-naming profile "
-				+ $"(Mixamo, ActorCore/CC, UE Mannequin, Rokoko BVH) or saved user preset.",
+			Text = $"\"{fileName}\" doesn't match a built-in profile (Mixamo, ActorCore/CC, UE Mannequin, Rigify, 3ds Max Biped and others) "
+				+ "or a saved preset. Choose how to map its bones:",
 			WordWrap = true,
-		} );
+		} ) );
 
-		Layout.Add( new Label( this )
-		{
-			Text = $"The automatic mapper produced a best-effort mapping at {autoConfidence * 100f:0}% confidence. "
-				+ "You can accept it, or assign the bones yourself.",
-			WordWrap = true,
-		} );
-
-		Layout.AddSpacingCell( 4 );
+		card.Layout.Add( new ChoiceRow( card, "auto_fix_high", "Auto-map", "RECOMMENDED", Theme.Green,
+			$"Use the automatic mapping ({autoConfidence * 100f:0}% confidence). Check it in the preview before converting.",
+			() => Choose( AutoMapChosen ) ) );
+		card.Layout.Add( new ChoiceRow( card, "device_hub", "Map bones manually", null, Theme.TextLight,
+			"Pick the source bone for each role yourself; it can be saved as a profile for this rig.",
+			() => Choose( ManualChosen ) ) );
+		var dl = card.Layout.Add( new ChoiceRow( card, "psychology", "Deep learning", "EXPERIMENTAL", Theme.Yellow,
+			dlAvailable
+				? "A neural retarget (SAME) that needs no mapping. Expect imperfect hands. Non-commercial license (CC BY-NC 4.0)."
+				: "Not installed: Assets/humanoid_retargeter/dl/same_v1.weights was not found.",
+			() => Choose( DeepLearningChosen ) ) );
+		dl.Enabled = dlAvailable;
 
 		var buttons = Layout.AddRow();
-		buttons.Spacing = 8;
-
-		var auto = buttons.Add( new Button.Primary( "Auto-map blindly (recommended)" ) { Icon = "auto_fix_high" } );
-		auto.Clicked = () => Choose( AutoMapChosen );
-
-		var dl = buttons.Add( new Button( "Deep learning (experimental)", "psychology" ) );
-		if ( dlAvailable )
-		{
-			dl.ToolTip = "Skeleton-agnostic neural retarget (SAME) - needs no bone mapping. "
-				+ "Expect imperfect hands; review the preview before converting. "
-				+ "Non-commercial model license (CC BY-NC 4.0).";
-			dl.Clicked = () => Choose( DeepLearningChosen );
-		}
-		else
-		{
-			dl.Enabled = false;
-			dl.ToolTip = "No model installed - Assets/humanoid_retargeter/dl/same_v1.weights not found";
-		}
-
-		var manual = buttons.Add( new Button( "Manual mapping…", "edit" ) );
-		manual.Clicked = () => Choose( ManualChosen );
-
 		buttons.AddStretchCell();
+		buttons.Add( new RtButton( this, "Decide later", null, Close, "Keep the file in the list as needing review", 28 ) );
 
 		Window.AdjustSize();
 	}
@@ -104,5 +87,71 @@ public sealed class NoProfileDialog : Dialog
 		base.OnDestroyed();
 		if ( !_chose )
 			Dismissed?.Invoke();
+	}
+
+	/// <summary>One clickable choice: icon, title and tag, and a line explaining it.</summary>
+	sealed class ChoiceRow : Widget
+	{
+		readonly string _icon, _title, _tag, _text;
+		readonly Color _tagColor;
+		readonly Action _clicked;
+
+		public ChoiceRow( Widget parent, string icon, string title, string tag, Color tagColor, string text, Action clicked ) : base( parent )
+		{
+			_icon = icon;
+			_title = title;
+			_tag = tag;
+			_tagColor = tagColor;
+			_text = text;
+			_clicked = clicked;
+			FixedHeight = 56;
+			Cursor = CursorShape.Finger;
+			MouseTracking = true;
+			ToolTip = text;
+		}
+
+		protected override void OnMouseEnter() => Update();
+		protected override void OnMouseLeave() => Update();
+
+		protected override void OnMouseClick( MouseEvent e )
+		{
+			base.OnMouseClick( e );
+			if ( Enabled && e.LeftMouseButton )
+				_clicked();
+		}
+
+		protected override void OnPaint()
+		{
+			Paint.Antialiasing = true;
+			var hover = Paint.HasMouseOver && Enabled;
+			Paint.SetPen( hover ? Theme.Green.WithAlpha( .6f ) : Theme.ControlBackground.Lighten( .45f ), 1 );
+			Paint.SetBrush( hover ? Theme.WindowBackground.Lighten( .35f ) : Theme.WindowBackground );
+			Paint.DrawRect( LocalRect.Shrink( .5f ), 6 );
+
+			Paint.SetPen( !Enabled ? Theme.TextDisabled : Theme.Green );
+			Paint.DrawIcon( new Rect( 12, (Height - 24) * .5f, 24, 24 ), _icon, 22 );
+
+			var x = 48f;
+			Paint.SetDefaultFont( 9, 600 );
+			Paint.SetPen( Enabled ? Theme.Text : Theme.TextDisabled );
+			var titleWidth = Paint.MeasureText( _title ).x;
+			Paint.DrawText( new Rect( x, 9, titleWidth + 4, 18 ), _title, TextFlag.LeftCenter );
+			if ( !string.IsNullOrEmpty( _tag ) )
+			{
+				Paint.SetDefaultFont( 7, 600 );
+				var tagWidth = Paint.MeasureText( _tag ).x + 16;
+				var tag = new Rect( x + titleWidth + 10, 9, tagWidth, 18 );
+				var color = Enabled ? _tagColor : Theme.TextDisabled;
+				Paint.ClearPen();
+				Paint.SetBrush( color.WithAlpha( .18f ) );
+				Paint.DrawRect( tag, 9 );
+				Paint.SetPen( color );
+				Paint.DrawText( tag, _tag, TextFlag.Center );
+			}
+			Paint.SetDefaultFont( 8 );
+			Paint.SetPen( Theme.TextLight );
+			var width = Width - x - 12;
+			Paint.DrawText( new Rect( x, 29, width, 18 ), Paint.GetElidedText( _text, width, ElideMode.Right, TextFlag.LeftCenter ), TextFlag.LeftCenter );
+		}
 	}
 }

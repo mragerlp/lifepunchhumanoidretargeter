@@ -405,7 +405,7 @@ public static class UiSmokeGate
 			Result.previewWidgetOk &= Result.previewGhostOk;
 
 			// Wireframe-skeleton view (the dialog's "Skeleton" toggle): switching over must
-			// draw the retargeted pose as stick bones - VISIBLY (cyan pixels) - and
+			// draw the retargeted pose as solid bones - VISIBLY (light gray pixels) - and
 			// switching back must re-show the model.
 			try
 			{
@@ -413,7 +413,7 @@ public static class UiSmokeGate
 				preview.ApplyCurrentFrame();
 				var lines = preview.SkeletonLineCount;
 				Result.previewSkeletonPixels = preview.CountRenderedPixels(
-					c => c.b > 0.45f && c.g > 0.45f && c.r < c.g * 0.8f );
+					c => c.r > 0.35f && MathF.Abs( c.r - c.g ) < 0.08f && MathF.Abs( c.g - c.b ) < 0.08f ); // Blender-gray bones
 				preview.SkeletonOnly = false;
 				preview.ApplyCurrentFrame();
 				Result.previewSkeletonViewOk = lines > 0 && !preview.SkeletonOnly
@@ -1144,7 +1144,7 @@ public static class UiSmokeGate
 			try
 			{
 				skeletonPixels = preview.CountRenderedPixels(
-					c => c.b > 0.45f && c.g > 0.45f && c.r < c.g * 0.8f );
+					c => c.r > 0.35f && MathF.Abs( c.r - c.g ) < 0.08f && MathF.Abs( c.g - c.b ) < 0.08f ); // Blender-gray bones
 			}
 			catch ( Exception e )
 			{

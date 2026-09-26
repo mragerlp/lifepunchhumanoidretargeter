@@ -372,6 +372,11 @@ public static class EditorPipeline
 							? uri => TargetPickers.ReadGltfDependency( destination, uri )
 							: null )
 						.Clips.Select( clip => clip.Name ).ToList();
+				// An empty AnimStack (UE exports carry one with no curves) is a name, not an
+				// animation: the importer finds no take in it, and converting it failed the
+				// batch with "Source file contains no animation takes".
+				if ( extension == ".fbx" && takes.Count > 0 && !HasImportableTakes( File.ReadAllBytes( destination ), fileName ) )
+					takes.Clear();
 				if ( takes.Count > 0 )
 				{
 					target.EmbeddedTakeNames = takes
@@ -1243,6 +1248,12 @@ public static class EditorPipeline
 		=> ExtractFbxObjectNames( data, "Material" );
 
 	/// <summary>Animation take (AnimStack) names from an FBX.</summary>
+	static bool HasImportableTakes( byte[] data, string fileName )
+	{
+		try { return Retargeter.ImportSource( data, fileName ).Clips.Count > 0; }
+		catch ( Exception ) { return false; }
+	}
+
 	internal static List<string> ExtractFbxTakeNames( byte[] data )
 		=> ExtractFbxObjectNames( data, "AnimStack" );
 

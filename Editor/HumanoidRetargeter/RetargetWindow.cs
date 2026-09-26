@@ -24,12 +24,11 @@ namespace HumanoidRetargeter.Editor;
 /// mapping stays per FILE (one skeleton per file). Every file carries its own mapping -
 /// a single batch may mix Mixamo, ActorCore and BVH sources.
 /// </summary>
-[Dock( "Editor", RetargetWindow.DockTitle, "sync_alt" )]
 public sealed class RetargetWindow : Widget
 {
-	/// <summary>Registered dock title — must match the <c>[Dock]</c> attribute above; used
-	/// to open the panel through the editor's <c>DockManager.SetDockState</c>.</summary>
+	/// <summary>The window title and its View menu entry.</summary>
 	public const string DockTitle = "Humanoid Retargeter";
+	public const string DockIcon = "sync_alt";
 
 	static RetargetWindow _instance;
 
@@ -68,24 +67,24 @@ public sealed class RetargetWindow : Widget
 	Layout _listLayout;
 	Button _convertButton;
 	Button _citizenSetupButton;
-	Button _pickAugmentButton;
+	RtButton _pickAugmentButton;
 	Label _statusLabel;
 	Widget _progressBar;
 	float _progress;
 	bool _converting;
 	Widget _reportGroup;
 	Layout _reportLines;
-	Button _reportToggle;
+	RtButton _reportToggle;
 
-	/// <summary>Dock constructor (called by the editor's dock manager).</summary>
+	/// <summary>Creates the retargeter inside its window (see <see cref="Open"/>).</summary>
 	public RetargetWindow( Widget parent ) : base( parent )
 	{
 		_instance ??= this;
 
 		Name = "HumanoidRetargeter";
-		WindowTitle = "Humanoid Retargeter";
-		SetWindowIcon( "sync_alt" );
-		MinimumSize = new Vector2( 720, 420 );
+		WindowTitle = DockTitle;
+		SetWindowIcon( DockIcon );
+		MinimumSize = new Vector2( 860, 540 );
 
 		Layout = Layout.Column();
 		BuildUi();
@@ -94,18 +93,49 @@ public sealed class RetargetWindow : Widget
 		RefreshAll();
 	}
 
+	// View menu: the entry opens a floating window (with the editor's dark title bar), like
+	// the Weapon Importer, instead of a dock panel that snaps into the editor layout.
+	[Event( "tools.editorwindow.createview" )]
+	static void RegisterViewMenu( Menu menu ) => EditorWindow.DockManager.RegisterDockType( new DockManager.DockInfo
+	{
+		Title = DockTitle,
+		Icon = DockIcon,
+		CreateAction = () =>
+		{
+			Open();
+			return null;
+		},
+	} );
+
+	[Event( "tools.editorwindow.postcreateview" )]
+	static void ConfigureViewMenu( Menu menu )
+	{
+		var option = menu.GetOption( DockTitle );
+		if ( option is null )
+			return;
+		option.Toggled = null;
+		option.Checkable = false;
+		option.Triggered = () => Open();
+	}
+
 	/// <summary>Opens (or raises) the window and returns it.</summary>
 	public static RetargetWindow Open()
 	{
-		// The editor removed DockManager.Create<T>(); SetDockState opens the
-		// [Dock]-registered panel by its title (the ctor sets _instance), matching the
-		// shipped Asset Browser's open path, then RaiseDock brings it to the front.
-		if ( Instance is null )
-			EditorWindow.DockManager.SetDockState( DockTitle, true );
-
-		var window = Instance;
-		if ( window.IsValid() )
-			EditorWindow.DockManager.RaiseDock( window );
+		if ( Instance is { } existing )
+		{
+			existing.GetWindow().Show();
+			existing.Show();
+			existing.GetWindow().Raise();
+			return existing;
+		}
+		var dialog = new Dialog( null );
+		dialog.Window.Title = DockTitle;
+		dialog.Window.SetWindowIcon( DockIcon );
+		dialog.Layout = Layout.Column();
+		var window = dialog.Layout.Add( new RetargetWindow( dialog ), 1 );
+		dialog.Window.MinimumSize = new Vector2( 860, 540 );
+		dialog.Window.Size = new Vector2( 1100, 680 );
+		dialog.Show();
 		return window;
 	}
 
@@ -118,221 +148,264 @@ public sealed class RetargetWindow : Widget
 
 	// ============================================================================ layout
 
+	RtPill _countPill;
+	RtDropZone _dropZone;
+	ScrollArea _listScroll;
+	Label _outputPath;
+	Label _targetInfo;
+	RtStatusDot _statusDot;
+	Widget _augmentRow;
+
+	const float SideWidth = 300f;
+	const float CaptionWidth = 78f;
+
+	/// <summary>
+	/// The clip list on the left and every setting in a narrow column of cards on the right, so
+	/// nothing is hidden: what goes in, onto which character, where it is written and how.
+	/// Previewing a clip opens the preview window.
+	/// </summary>
 	void BuildUi()
 	{
-		// ---- top bar -------------------------------------------------------------------
+		Layout.Margin = 10;
+		Layout.Spacing = 8;
+		AcceptDrops = true;
+
+		// ---- top bar ---------------------------------------------------------------------
 		var top = Layout.AddRow();
-		top.Margin = 8;
 		top.Spacing = 8;
-
-		var add = top.Add( new Button.Primary( "Add Files…" ) { Icon = "add" } );
-		add.ToolTip = "Add .fbx / .bvh / .glb / .gltf / .vrm / .anm / .an5 / .cba animation files to convert";
+		var add = top.Add( new Button.Primary( "Add Files…" ) { Icon = "add", Tint = Theme.Green, FixedHeight = 28 } );
+		add.ToolTip = "Add .fbx / .bvh / .glb / .gltf / .vrm / .anm / .an5 / .cba animation files to convert (or drop them on this panel)";
 		add.Clicked = AddFilesViaDialog;
-
-		top.AddSpacingCell( 8 );
-		top.Add( new Label( this ) { Text = "Target:" } );
-		var targetCombo = top.Add( new ComboBox( this ) { MinimumWidth = 190 } );
-		targetCombo.AddItem( "s&box Human (default)", "person", TrySelectSboxTarget, selected: true );
-		targetCombo.AddItem( "s&box Citizen (classic)", "person_outline", TrySelectSboxCitizenTarget );
-		targetCombo.AddItem( "Custom model (.vmdl)…", "view_in_ar", PickCustomModelTarget );
-		targetCombo.AddItem( "Custom model file (.fbx/.glb/.gltf)…", "category", PickCustomFbxTarget );
-
-		top.AddSpacingCell( 8 );
-		top.Add( new Label( this ) { Text = "Output:" } );
-		var outputCombo = top.Add( new ComboBox( this ) { MinimumWidth = 200 } );
-		outputCombo.AddItem( "New animation vmdl", "note_add", () => SetAugmentMode( false ), selected: true );
-		outputCombo.AddItem( "Add to existing vmdl…", "library_add", () => SetAugmentMode( true ) );
-
-		_pickAugmentButton = top.Add( new Button( "Pick vmdl…", "folder_open" ) );
-		_pickAugmentButton.Visible = false;
-		_pickAugmentButton.Clicked = PickAugmentAsset;
-
+		top.Add( new RtButton( this, "Smart Port…", "swap_horiz", () => new SmartPortDialog( this ).Show(),
+			"Smart Port: bring a whole animation setup (clips, events and animgraph) from one model onto another character", 28 ) );
 		top.AddStretchCell();
-
-		_convertButton = top.Add( new Button.Primary( "Convert All" ) { Icon = "play_arrow" } );
-		_convertButton.Tint = Theme.Green;
+		_outputPath = top.Add( RtStyle.Muted( new Label( "", this ) { FixedHeight = 28, MinimumWidth = 20 }, small: true ) );
+		_outputPath.Alignment = TextFlag.RightCenter;
+		_convertButton = top.Add( new Button.Primary( "Convert All" ) { Icon = "play_arrow", Tint = Theme.Green, FixedHeight = 28 } );
+		_convertButton.ToolTip = "Retarget every clip in the list and write the animation model";
 		_convertButton.Clicked = () => _ = ConvertEntriesAsync( null );
 
-		// ---- file list -------------------------------------------------------------------
-		var scroll = Layout.Add( new ScrollArea( this ), 1 );
-		scroll.Canvas = new Widget( scroll );
-		scroll.Canvas.Layout = Layout.Column();
-		scroll.Canvas.Layout.Margin = new Sandbox.UI.Margin( 8, 4, 16, 4 );
-		scroll.Canvas.Layout.Spacing = 2;
-		_listLayout = scroll.Canvas.Layout;
+		// ---- body: clips | settings -------------------------------------------------------
+		var body = Layout.AddRow( 1 );
+		body.Spacing = 8;
 
-		// ---- options ---------------------------------------------------------------------
-		// Three stacked COLUMNS, not one ever-wider row: new toggles grow DOWN their column,
-		// so the window stays narrow as options accumulate.
-		var options = Layout.Add( new Group( this ) { Title = "Options", Icon = "tune" } );
-		options.Layout = Layout.Row();
-		options.Layout.Margin = new Sandbox.UI.Margin( 14, 30, 14, 12 );
-		options.Layout.Spacing = 24;
+		var left = body.AddColumn( 1 );
+		left.Spacing = 8;
+		var list = left.Add( new RtCard( this ), 1 );
+		var listHeader = list.Header( "movie", "Clips" );
+		_countPill = listHeader.Add( new RtPill( list, "", Theme.TextLight, "Clips in the list" ) );
+		listHeader.AddStretchCell();
+		listHeader.Add( RtStyle.Icon( list, "add", AddFilesViaDialog, "Add animation files…", 22 ) );
+		listHeader.Add( RtStyle.Icon( list, "playlist_remove", ClearEntries, "Remove every clip from the list", 22 ) );
+		_dropZone = list.Layout.Add( new RtDropZone( list, AddFiles, AddFilesViaDialog ), 1 );
+		_listScroll = list.Layout.Add( new ScrollArea( list ), 1 );
+		_listScroll.HorizontalScrollbarMode = ScrollbarMode.Off;
+		_listScroll.Canvas = new Widget( _listScroll );
+		_listScroll.SetStyles( "background-color: transparent;" );
+		_listScroll.Canvas.SetStyles( "background-color: transparent;" );
+		_listScroll.Canvas.Layout = Layout.Column();
+		_listScroll.Canvas.Layout.Margin = new Sandbox.UI.Margin( 0, 0, 10, 0 );
+		_listScroll.Canvas.Layout.Spacing = 4;
+		_listLayout = _listScroll.Canvas.Layout;
 
-		// -- column 1: root motion + motion-quality / output-variant toggles ---------------
-		var col1 = options.Layout.AddColumn();
-		col1.Spacing = 6;
-
-		var rootRow = col1.AddRow();
-		rootRow.Spacing = 8;
-		rootRow.Add( new Label( this ) { Text = "Root motion:" } );
-		var rootCombo = rootRow.Add( new ComboBox( this ) { MinimumWidth = 150 } );
-		rootCombo.AddItem( "Keep as authored", null, () => _rootMotion = RootMotionMode.Off, selected: true );
-		rootCombo.AddItem( "In place (strip)", null, () => _rootMotion = RootMotionMode.InPlace );
-		rootCombo.AddItem( "Extract to root", null, () => _rootMotion = RootMotionMode.Extract );
-		rootRow.AddStretchCell();
-
-		var footPlant = col1.Add( new Checkbox( "Foot-plant cleanup" ) { Value = _footPlant } );
-		footPlant.Clicked = () => _footPlant = footPlant.Value;
-
-		var carriage = col1.Add( new Checkbox( "Natural shoulder/neck/head/foot carriage" ) { Value = _naturalCarriage } );
-		carriage.ToolTip = "Keep the s&box body's own shoulder line, neck posture, skull attitude and ankle anatomy, transferring only the "
-			+ "source's motion (a source whose bind pose is itself posed - e.g. a fighting-stance rest - automatically keeps the head "
-			+ "following the source's gaze instead). "
-			+ "Untick to exactly copy the source rig's shoulder/neck/head/foot directions (can look slumped/hunched, tip the head and bend "
-			+ "planted feet upward on differently-proportioned rigs).";
-		carriage.Clicked = () => _naturalCarriage = carriage.Value;
-
-		var footsteps = col1.Add( new Checkbox( "Footstep events" ) { Value = _footstepEvents } );
-		footsteps.ToolTip = "Generates AE_FOOTSTEP events from detected foot plants.";
-		footsteps.Clicked = () => _footstepEvents = footsteps.Value;
-
-		var mirrored = col1.Add( new Checkbox( "Mirrored variants" ) { Value = _mirroredVariants } );
-		mirrored.ToolTip = "Also produce a left/right-mirrored twin of every clip, named <clip>_M.";
-		mirrored.Clicked = () => _mirroredVariants = mirrored.Value;
-
-		var additive = col1.Add( new Checkbox( "Additive variants" ) { Value = _additiveVariants } );
-		additive.ToolTip = "Also emit an additive '<clip>_delta' sequence per clip (AnimSubtract) for animgraph layering.";
-		additive.Clicked = () => _additiveVariants = additive.Value;
-		var additiveRow = col1.AddRow();
-		additiveRow.Add( new Label( this ) { Text = "Additive reference frame:" } );
-		_additiveReferenceEdit = additiveRow.Add( new LineEdit( this ) { Text = "0", MaximumWidth = 55 } );
-		_additiveReferenceEdit.ToolTip = "Zero-based frame in the sampled output. Choose a neutral pose; additive variants carry no footstep events or motion extraction.";
-
-		// Smart-disabled toggle: RefreshLocomotionCheckbox (run on every list refresh) only
-		// enables it while the current take rows actually contain a complete directional
-		// family; the tooltip names what was detected (or what naming would be needed).
-		// HIDDEN from the panel (user request 2026-07-04: "i don't want it to be seen") -
-		// the detection plumbing, the gate hooks and the smart-disable scan stay wired so
-		// the feature can return by flipping Visible.
-		_locomotionCheckbox = col1.Add( new Checkbox( "Detect locomotion sets" ) { Value = _detectLocomotionSets } );
-		_locomotionCheckbox.Clicked = () => _detectLocomotionSets = _locomotionCheckbox.Value;
-		_locomotionCheckbox.Visible = false;
-
-		col1.AddStretchCell();
-
-		// -- column 2: looping + arm IK + output folder -------------------------------------
-		var col2 = options.Layout.AddColumn();
-		col2.Spacing = 6;
-
-		var loopRow = col2.AddRow();
-		loopRow.Spacing = 8;
-		loopRow.Add( new Label( this ) { Text = "Looping:" } );
-		var loopCombo = loopRow.Add( new ComboBox( this ) { MinimumWidth = 120 } );
-		loopCombo.AddItem( "From source", null, () => _loopOverride = null, selected: true );
-		loopCombo.AddItem( "Force on", null, () => _loopOverride = true );
-		loopCombo.AddItem( "Force off", null, () => _loopOverride = false );
-		loopRow.AddStretchCell();
-
-		var armIk = col2.Add( new Checkbox( "Arm effector IK" ) { Value = _armIk } );
-		armIk.ToolTip = "Pull wrists onto limb-length-normalized source hand positions. "
-			+ "On by default so differently proportioned arms preserve the source hand path; "
-			+ "disable to preserve exact limb directions instead.";
-		armIk.Clicked = () => _armIk = armIk.Value;
-
-		var outputRow = col2.AddRow();
-		outputRow.Spacing = 8;
-		outputRow.Add( new Label( this ) { Text = "Output folder:" } );
-		_outputFolderEdit = outputRow.Add( new LineEdit( this ) { Text = "animations/retargeted", MinimumWidth = 140 }, 1 );
-		_outputFolderEdit.ToolTip = "Assets-relative folder the DMX files (and the standalone vmdl) are written to.";
-
-		var outputNameRow = col2.AddRow();
-		outputNameRow.Spacing = 8;
-		outputNameRow.Add( new Label( this ) { Text = "New vmdl name:" } );
-		_outputNameEdit = outputNameRow.Add( new LineEdit( this )
-			{ Text = "retargeted_animations", MinimumWidth = 140 }, 1 );
-		_outputNameEdit.ToolTip = "Filename for New animation vmdl output. The .vmdl extension is optional; existing-vmdl mode ignores this field.";
-
-		var copyGraph = col2.Add( new Checkbox( "Copy editable Citizen animgraph" ) { Value = _copyAnimGraph } );
-		copyGraph.ToolTip = "Setup copies the actual Citizen graph to graphs/<model name>.vanmgrph beside the output model. Stock replacements always use a project-owned copy.";
-		copyGraph.Clicked = () => _copyAnimGraph = copyGraph.Value;
-		_citizenSetupButton = col2.Add( new Button( "Create Citizen animation model", "accessibility_new" ) );
-		_citizenSetupButton.Enabled = false;
-		_citizenSetupButton.Clicked = () => _ = CreateCitizenAnimationModelAsync();
-		var smartPort = col2.Add( new Button( "Smart Port…", "swap_horiz" ) );
-		smartPort.ToolTip = "Copy a local or cloud model's animation setup and animgraph onto a compatible custom character.";
-		smartPort.Clicked = () => new SmartPortDialog( this ).Show();
-
-		col2.AddStretchCell();
-
-		// -- column 3: numeric tunables ------------------------------------------------------
-		var col3 = options.Layout.AddColumn();
-		col3.Spacing = 6;
-
-		var hipRow = col3.AddRow();
-		hipRow.Spacing = 8;
-		hipRow.Add( new Label( this ) { Text = "Hip scale H/V:" } );
-		_hipScaleHEdit = hipRow.Add( new LineEdit( this ) { PlaceholderText = "auto", FixedWidth = 46 } );
-		_hipScaleHEdit.ToolTip = "Scale of the pelvis translation perpendicular to the character up axis. "
-			+ "Empty = automatic (target hip height / source hip height).";
-		_hipScaleVEdit = hipRow.Add( new LineEdit( this ) { PlaceholderText = "auto", FixedWidth = 46 } );
-		_hipScaleVEdit.ToolTip = "Scale of the pelvis translation along the character up axis. "
-			+ "Empty = automatic (hip-height ratio).";
-		hipRow.AddStretchCell();
-
-		var fpsRow = col3.AddRow();
-		fpsRow.Spacing = 8;
-		fpsRow.Add( new Label( this ) { Text = "Sample fps:" } );
-		_sampleFpsEdit = fpsRow.Add( new LineEdit( this ) { PlaceholderText = "30", FixedWidth = 46 } );
-		_sampleFpsEdit.ToolTip = "Sample rate the source clips are resampled to on import. "
-			+ "Empty or 0 = default (30 fps).";
-		fpsRow.AddStretchCell();
-
-		col3.AddStretchCell();
-
-		options.Layout.AddStretchCell();
-
-		// ---- conversion report --------------------------------------------------------------
-		// "What happened" panel: import diagnostics (mid-pose exports, static-channel
-		// disagreements), mapping/pipeline notes, per-clip failures and write warnings that
-		// previously only went to the console log. Populated after every conversion; the
-		// status-strip Report button toggles it, and it opens itself when something warned.
-		_reportGroup = Layout.Add( new Group( this ) { Title = "Conversion report", Icon = "receipt_long" } );
-		_reportGroup.Layout = Layout.Column();
-		_reportGroup.Layout.Margin = new Sandbox.UI.Margin( 14, 30, 14, 10 );
-		var reportScroll = new ScrollArea( _reportGroup );
-		reportScroll.MaximumHeight = 140;
+		// "What happened" panel: import diagnostics, mapping notes, clip failures and write
+		// warnings. Filled after every conversion; opens itself when something warned.
+		var report = left.Add( new RtCard( this ) );
+		_reportGroup = report;
+		var reportHeader = report.Header( "receipt_long", "Conversion report" );
+		reportHeader.AddStretchCell();
+		reportHeader.Add( RtStyle.Icon( report, "close", () => _reportGroup.Visible = false, "Hide the report", 22 ) );
+		var reportScroll = report.Layout.Add( new ScrollArea( report ) );
+		reportScroll.MaximumHeight = 120;
 		reportScroll.Canvas = new Widget( reportScroll );
 		reportScroll.Canvas.Layout = Layout.Column();
 		reportScroll.Canvas.Layout.Spacing = 2;
 		_reportLines = reportScroll.Canvas.Layout;
-		_reportGroup.Layout.Add( reportScroll );
-		_reportGroup.Visible = false;
+		report.Visible = false;
 
-		// ---- status strip -----------------------------------------------------------------
+		var side = body.Add( new ScrollArea( this ) { FixedWidth = SideWidth + 12 } );
+		side.HorizontalScrollbarMode = ScrollbarMode.Off;
+		var canvas = new Widget( side );
+		side.SetStyles( "background-color: transparent;" );
+		canvas.SetStyles( "background-color: transparent;" );
+		canvas.Layout = Layout.Column();
+		canvas.Layout.Margin = new Sandbox.UI.Margin( 0, 0, 12, 0 ); // clear of the overlay scrollbar
+		canvas.Layout.Spacing = 8;
+		BuildSettings( canvas );
+		canvas.Layout.AddStretchCell();
+		side.Canvas = canvas;
+
+		// ---- status line --------------------------------------------------------------------
 		var strip = Layout.AddRow();
-		strip.Margin = new Sandbox.UI.Margin( 8, 4, 8, 6 );
 		strip.Spacing = 8;
-		_statusLabel = strip.Add( new Label( this ) { Text = "Add animation files to get started." }, 1 );
-		_reportToggle = strip.Add( new Button( "Report", "receipt_long" ) );
+		_statusDot = strip.Add( new RtStatusDot( this ) );
+		_statusLabel = strip.Add( new Label( this ) { Text = "Add animation files to get started.", WordWrap = false,
+			FixedHeight = RtStyle.ControlHeight, MinimumWidth = 40 }, 1 );
+		_reportToggle = strip.Add( new RtButton( this, "Report", "receipt_long", () => _reportGroup.Visible = !_reportGroup.Visible,
+			"Show or hide the conversion report" ) );
 		_reportToggle.Visible = false;
-		_reportToggle.Clicked = () => _reportGroup.Visible = !_reportGroup.Visible;
-		_progressBar = strip.Add( new Widget( this ) { FixedHeight = 12, FixedWidth = 200 } );
+		_progressBar = strip.Add( new Widget( this ) { FixedHeight = 8, FixedWidth = 160 } );
 		_progressBar.OnPaintOverride = PaintProgress;
 		_progressBar.Visible = false;
+
+		UpdateSettingsSummary();
+	}
+
+	void BuildSettings( Widget canvas )
+	{
+		// -- character -----------------------------------------------------------------------
+		var character = canvas.Layout.Add( new RtCard( canvas ) );
+		character.Header( "accessibility_new", "Character" );
+		var targetCombo = character.Layout.Add( RtStyle.Field( new ComboBox( character ) { ToolTip = "The character the animations are retargeted onto" } ) );
+		targetCombo.AddItem( "s&box Human (default)", "person", TrySelectSboxTarget, selected: true );
+		targetCombo.AddItem( "s&box Citizen (classic)", "person_outline", TrySelectSboxCitizenTarget );
+		targetCombo.AddItem( "Custom model (.vmdl)…", "view_in_ar", PickCustomModelTarget );
+		targetCombo.AddItem( "Custom model file (.fbx/.glb/.gltf)…", "category", PickCustomFbxTarget );
+		_targetInfo = character.Layout.Add( RtStyle.Muted( new Label( "", character ) { WordWrap = true }, small: true ) );
+		_citizenSetupButton = character.Layout.Add( new Button( "Create Citizen animation model", "accessibility_new" ) { FixedHeight = 26 } );
+		_citizenSetupButton.Enabled = false;
+		_citizenSetupButton.Clicked = () => _ = CreateCitizenAnimationModelAsync();
+		RtStyle.Check( character.Layout, "Copy editable Citizen animgraph", _copyAnimGraph, v => _copyAnimGraph = v,
+			"Setup copies the actual Citizen graph to graphs/<model name>.vanmgrph beside the output model. Stock replacements always use a project-owned copy." );
+
+		// -- output ----------------------------------------------------------------------------
+		var output = canvas.Layout.Add( new RtCard( canvas ) );
+		output.Header( "inventory_2", "Output" );
+		var modeRow = RtStyle.FieldRow( output, output.Layout, "Write to", CaptionWidth );
+		var outputCombo = modeRow.Add( RtStyle.Field( new ComboBox( output ) ), 1 );
+		outputCombo.AddItem( "New animation model", "note_add", () => SetAugmentMode( false ), selected: true );
+		outputCombo.AddItem( "Add to existing model…", "library_add", () => SetAugmentMode( true ) );
+		_augmentRow = output.Layout.Add( new Widget( output ) );
+		_augmentRow.Layout = Layout.Row();
+		_augmentRow.Layout.Spacing = 6;
+		_augmentRow.Layout.Add( RtStyle.Muted( new Label( "Model", _augmentRow ) { FixedWidth = CaptionWidth, FixedHeight = RtStyle.ControlHeight } ) );
+		_pickAugmentButton = _augmentRow.Layout.Add( new RtButton( _augmentRow, "Pick vmdl…", "folder_open", PickAugmentAsset,
+			"The model the animations are added to" ) );
+		_augmentRow.Layout.AddStretchCell();
+		_augmentRow.Visible = false;
+		var folderRow = RtStyle.FieldRow( output, output.Layout, "Folder", CaptionWidth );
+		_outputFolderEdit = folderRow.Add( RtStyle.Field( new LineEdit( output ) { Text = "animations/retargeted" } ), 1 );
+		_outputFolderEdit.ToolTip = "Assets-relative folder the DMX files (and the standalone vmdl) are written to.";
+		_outputFolderEdit.TextEdited += _ => UpdateSettingsSummary();
+		var nameRow = RtStyle.FieldRow( output, output.Layout, "Model name", CaptionWidth );
+		_outputNameEdit = nameRow.Add( RtStyle.Field( new LineEdit( output ) { Text = "retargeted_animations" } ), 1 );
+		_outputNameEdit.ToolTip = "Filename for New animation vmdl output. The .vmdl extension is optional; existing-vmdl mode ignores this field.";
+		_outputNameEdit.TextEdited += _ => UpdateSettingsSummary();
+
+		// -- motion ----------------------------------------------------------------------------
+		var motion = canvas.Layout.Add( new RtCard( canvas ) );
+		motion.Header( "directions_run", "Motion" );
+		var rootRow = RtStyle.FieldRow( motion, motion.Layout, "Root motion", CaptionWidth );
+		var rootCombo = rootRow.Add( RtStyle.Field( new ComboBox( motion ) ), 1 );
+		rootCombo.AddItem( "Keep as authored", null, () => _rootMotion = RootMotionMode.Off, selected: true );
+		rootCombo.AddItem( "In place (strip)", null, () => _rootMotion = RootMotionMode.InPlace );
+		rootCombo.AddItem( "Extract to root", null, () => _rootMotion = RootMotionMode.Extract );
+		var loopRow = RtStyle.FieldRow( motion, motion.Layout, "Looping", CaptionWidth );
+		var loopCombo = loopRow.Add( RtStyle.Field( new ComboBox( motion ) ), 1 );
+		loopCombo.AddItem( "From source", null, () => _loopOverride = null, selected: true );
+		loopCombo.AddItem( "Force on", null, () => _loopOverride = true );
+		loopCombo.AddItem( "Force off", null, () => _loopOverride = false );
+		RtStyle.Check( motion.Layout, "Foot-plant cleanup", _footPlant, v => _footPlant = v,
+			"Lock planted feet to the ground and keep them from sliding." );
+		RtStyle.Check( motion.Layout, "Arm effector IK", _armIk, v => _armIk = v,
+			"Pull wrists onto limb-length-normalized source hand positions. On by default so differently proportioned arms "
+			+ "preserve the source hand path; disable to preserve exact limb directions instead." );
+		RtStyle.Check( motion.Layout, "Natural shoulders, neck, head, feet", _naturalCarriage, v => _naturalCarriage = v,
+			"Keep the s&box body's own shoulder line, neck posture, skull attitude and ankle anatomy, transferring only the "
+			+ "source's motion (a source whose bind pose is itself posed - e.g. a fighting-stance rest - automatically keeps the head "
+			+ "following the source's gaze instead). Untick to exactly copy the source rig's shoulder/neck/head/foot directions "
+			+ "(can look slumped/hunched, tip the head and bend planted feet upward on differently-proportioned rigs)." );
+		var hipRow = RtStyle.FieldRow( motion, motion.Layout, "Hip scale", CaptionWidth,
+			"Scale of the pelvis translation, horizontal / vertical. Empty = automatic (target hip height / source hip height)." );
+		_hipScaleHEdit = hipRow.Add( RtStyle.Field( new LineEdit( motion ) { PlaceholderText = "auto" } ), 1 );
+		_hipScaleHEdit.ToolTip = "Scale of the pelvis translation perpendicular to the character up axis. "
+			+ "Empty = automatic (target hip height / source hip height).";
+		_hipScaleVEdit = hipRow.Add( RtStyle.Field( new LineEdit( motion ) { PlaceholderText = "auto" } ), 1 );
+		_hipScaleVEdit.ToolTip = "Scale of the pelvis translation along the character up axis. "
+			+ "Empty = automatic (hip-height ratio).";
+		var fpsRow = RtStyle.FieldRow( motion, motion.Layout, "Sample fps", CaptionWidth );
+		_sampleFpsEdit = fpsRow.Add( RtStyle.Field( new LineEdit( motion ) { PlaceholderText = "30" } ), 1 );
+		_sampleFpsEdit.ToolTip = "Sample rate the source clips are resampled to on import. "
+			+ "Empty or 0 = default (30 fps).";
+
+		// -- extra outputs ------------------------------------------------------------------------
+		var extras = canvas.Layout.Add( new RtCard( canvas ) );
+		extras.Header( "library_add_check", "Extra outputs" );
+		RtStyle.Check( extras.Layout, "Footstep events", _footstepEvents, v => _footstepEvents = v,
+			"Generates AE_FOOTSTEP events from detected foot plants." );
+		RtStyle.Check( extras.Layout, "Mirrored variants (_M)", _mirroredVariants, v => _mirroredVariants = v,
+			"Also produce a left/right-mirrored twin of every clip, named <clip>_M." );
+		var additiveRow = extras.Layout.AddRow();
+		additiveRow.Spacing = 6;
+		RtStyle.Check( additiveRow, "Additive variants, frame", _additiveVariants, v => _additiveVariants = v,
+			"Also emit an additive '<clip>_delta' sequence per clip (AnimSubtract) for animgraph layering." );
+		_additiveReferenceEdit = additiveRow.Add( RtStyle.Field( new LineEdit( extras ) { Text = "0", FixedWidth = 44 } ) );
+		_additiveReferenceEdit.ToolTip = "Zero-based frame in the sampled output. Choose a neutral pose; additive variants carry no footstep events or motion extraction.";
+		additiveRow.AddStretchCell();
+
+		// Smart-disabled toggle: RefreshLocomotionCheckbox (run on every list refresh) only
+		// enables it while the current take rows actually contain a complete directional
+		// family. HIDDEN from the panel (user request 2026-07-04: "i don't want it to be
+		// seen") - the detection plumbing, the gate hooks and the smart-disable scan stay
+		// wired so the feature can return by flipping Visible.
+		_locomotionCheckbox = extras.Layout.Add( new Checkbox( "Detect locomotion sets" ) { Value = _detectLocomotionSets } );
+		_locomotionCheckbox.Clicked = () => _detectLocomotionSets = _locomotionCheckbox.Value;
+		_locomotionCheckbox.Visible = false;
+	}
+
+	/// <summary>The top bar says where Convert All writes.</summary>
+	void UpdateSettingsSummary()
+	{
+		if ( !_outputPath.IsValid() )
+			return;
+		_outputPath.Text = _augmentMode
+			? "→ " + (_augmentAsset?.Name ?? "pick a model to add to")
+			: $"→ {NormalizedOutputFolder()}/{NormalizedOutputName()}.vmdl";
+		if ( _targetInfo.IsValid() )
+		{
+			// Only when it adds something to the picker: an error, a warning or a custom model.
+			_targetInfo.Text = _target is null ? (_targetError ?? "No target selected.")
+				: _target.Warning is { Length: > 0 } warning ? warning
+				: _target.ModelFilePath is not null || _target.CustomVmdlPath is not null ? _target.Description : "";
+			_targetInfo.Visible = _targetInfo.Text.Length > 0;
+		}
 	}
 
 	bool PaintProgress()
 	{
+		Paint.Antialiasing = true;
 		Paint.ClearPen();
 		Paint.SetBrush( Theme.ControlBackground );
-		Paint.DrawRect( _progressBar.LocalRect, 3 );
+		Paint.DrawRect( _progressBar.LocalRect, 4 );
 		var r = _progressBar.LocalRect;
 		r.Width *= _progress.Clamp( 0f, 1f );
-		Paint.ClearPen();
 		Paint.SetBrush( Theme.Green );
-		Paint.DrawRect( r, 3 );
+		Paint.DrawRect( r, 4 );
 		return true;
+	}
+
+	// Drop animation files anywhere on the panel.
+	public override void OnDragHover( DragEvent e )
+	{
+		if ( RtDrop.Paths( e.Data ).Count > 0 )
+			e.Action = DropAction.Link;
+	}
+
+	public override void OnDragDrop( DragEvent e )
+	{
+		var paths = RtDrop.Paths( e.Data );
+		if ( paths.Count == 0 )
+			return;
+		e.Action = DropAction.Link;
+		AddFiles( paths );
+	}
+
+	void ClearEntries()
+	{
+		if ( _converting )
+			return;
+		_entries.Clear();
+		RefreshAll();
 	}
 
 	// ============================================================================ target
@@ -538,7 +611,7 @@ public sealed class RetargetWindow : Widget
 	void SetAugmentMode( bool augment )
 	{
 		_augmentMode = augment;
-		_pickAugmentButton.Visible = augment;
+		_augmentRow.Visible = augment;
 		_outputNameEdit.Enabled = !augment;
 		if ( augment && _augmentAsset is null )
 			PickAugmentAsset();
@@ -671,6 +744,7 @@ public sealed class RetargetWindow : Widget
 
 	void RemoveEntry( SourceFileEntry entry )
 	{
+		_rowRemovedAt = Environment.TickCount64;
 		_entries.Remove( entry );
 		RefreshAll();
 	}
@@ -707,8 +781,13 @@ public sealed class RetargetWindow : Widget
 	}
 
 	/// <summary>Removes one take row; the file entry goes with its last take.</summary>
+	/// <summary>When a row was last removed (Environment.TickCount64): the rows below slide up
+	/// under the cursor, so a quick next click must not count as a double-click on them.</summary>
+	long _rowRemovedAt;
+
 	void RemoveTake( SourceTakeEntry take )
 	{
+		_rowRemovedAt = Environment.TickCount64;
 		take.File.Takes.Remove( take );
 		if ( take.File.Takes.Count == 0 )
 			_entries.Remove( take.File );
@@ -1526,45 +1605,43 @@ public sealed class RetargetWindow : Widget
 			return;
 
 		_listLayout.Clear( true );
+		var empty = _entries.Count == 0;
+		if ( _dropZone.IsValid() )
+			_dropZone.Visible = empty;
+		if ( _listScroll.IsValid() )
+			_listScroll.Visible = !empty;
 
-		if ( _entries.Count == 0 )
+		// One row per TAKE: a multi-take file unpacks into individual entries, each
+		// independently previewable/removable/convertible. Unreadable files (no takes) keep a
+		// single file-level row.
+		foreach ( var entry in _entries )
 		{
-			var empty = _listLayout.Add( new Label( this )
-			{
-				Text = "No files yet. Use \"Add Files…\" or right-click .fbx/.bvh/.glb/.gltf/.vrm/.anm/.an5/.cba files in the "
-					+ "Asset Browser and choose \"Retarget to s&box rig…\".",
-				WordWrap = true,
-			} );
-			empty.SetStyles( $"color: {Theme.TextLight.Hex}; margin: 12px;" );
+			if ( entry.Takes.Count == 0 )
+				_listLayout.Add( new ClipRow( this, entry, null ) );
+			else
+				foreach ( var take in entry.Takes )
+					_listLayout.Add( new ClipRow( this, entry, take ) );
 		}
-		else
-		{
-			// One row per TAKE: a multi-take file unpacks into individual entries
-			// ("file.fbx · TakeName"), each independently previewable/removable/convertible.
-			// Unreadable files (no takes) keep a single file-level row.
-			foreach ( var entry in _entries )
-			{
-				if ( entry.Takes.Count == 0 )
-					_listLayout.Add( new FileRow( this, entry, null ) );
-				else
-					foreach ( var take in entry.Takes )
-						_listLayout.Add( new FileRow( this, entry, take ) );
-			}
-		}
-
 		_listLayout.AddStretchCell();
+
+		if ( _countPill.IsValid() )
+		{
+			var clips = _entries.Sum( e => Math.Max( e.Takes.Count, 1 ) );
+			_countPill.Set( clips == 0 ? "" : clips == 1 ? "1 CLIP" : $"{clips} CLIPS", Theme.TextLight );
+		}
 	}
 
 	void RefreshStatus()
 	{
 		RefreshCitizenSetupButton();
+		UpdateSettingsSummary();
 		if ( _convertButton.IsValid() )
 			_convertButton.Enabled = !_converting && _entries.Any( e => e.Scene is not null );
 
 		if ( _targetError is not null )
 			SetStatus( _targetError, Theme.Red );
 		else if ( !_converting && _target is not null )
-			SetStatus( $"Target: {_target.Description}   ·   {_entries.Count} file(s)", Theme.TextLight );
+			SetStatus( $"{_target.Description}   ·   {_entries.Sum( e => Math.Max( e.Takes.Count, 1 ) )} clip(s)", Theme.TextLight );
 	}
 
 	void SetStatus( string text, Color color )
@@ -1572,7 +1649,10 @@ public sealed class RetargetWindow : Widget
 		if ( !_statusLabel.IsValid() )
 			return;
 		_statusLabel.Text = text;
-		_statusLabel.SetStyles( $"color: {color.Hex};" );
+		_statusLabel.ToolTip = text;
+		_statusLabel.SetStyles( $"color: {(color == Theme.TextLight ? Theme.Text : color).Hex};" );
+		if ( _statusDot.IsValid() )
+			_statusDot.Color = color == Theme.TextLight ? Theme.Green : color;
 	}
 
 	// ============================================================================ row widget
@@ -1584,23 +1664,66 @@ public sealed class RetargetWindow : Widget
 		var path = _augmentMode ? _augmentAsset.Path : NormalizedOutputFolder() + "/" + NormalizedOutputName() + ".vmdl";
 		var dialog = new Dialog( this );
 		dialog.Window.WindowTitle = "Replace stock animation";
-		dialog.Window.MinimumWidth = 540;
+		dialog.Window.SetWindowIcon( "swap_horiz" );
+		dialog.Window.SetModal( true, true );
+		dialog.Window.MinimumWidth = 520;
 		dialog.Layout = Layout.Column();
-		dialog.Layout.Margin = 20;
-		dialog.Layout.Spacing = 12;
-		dialog.Layout.Add( new Label( dialog ) { Text = take.DisplayName + " → " + path, WordWrap = true } );
+		dialog.Layout.Margin = 10;
+		dialog.Layout.Spacing = 8;
+
 		var suggestion = take.SuggestLocomotion();
 		StockAnimationSlot selected = suggestion is null ? null : StockAnimationGraph.Slots.FirstOrDefault( s => s.Id == suggestion.SlotId );
-		var combo = dialog.Layout.Add( new ComboBox( dialog ) );
-		var note = dialog.Layout.Add( new Label( dialog ) { WordWrap = true, Text = selected?.Warning ?? "Choose which stock animation to replace." } );
-		var apply = dialog.Layout.Add( new Button.Primary( "Retarget and replace" ) { Enabled = selected is not null } );
-		combo.AddItem( "Choose stock slot…", null, () => { selected = null; apply.Enabled = false; }, selected: selected is null );
+
+		var card = dialog.Layout.Add( new RtCard( dialog ) );
+		card.Header( "swap_horiz", "Replace a stock animation" );
+		card.Layout.Add( RtStyle.Muted( new Label( dialog )
+		{
+			Text = "Swap one of the Citizen graph's own animations (idle, walk, run, jump) for this clip. "
+				+ "The model keeps every other stock animation.",
+			WordWrap = true,
+		}, small: true ) );
+
+		const float caption = 72f;
+		var clipRow = RtStyle.FieldRow( card, card.Layout, "Clip", caption );
+		clipRow.Add( new Label( card ) { Text = take.DisplayName, FixedHeight = RtStyle.FieldHeight, ToolTip = take.File.FilePath } ).SetStyles( "font-weight: 600;" );
+		clipRow.AddStretchCell();
+		var modelRow = RtStyle.FieldRow( card, card.Layout, "Model", caption );
+		modelRow.Add( RtStyle.Muted( new Label( card ) { Text = path, FixedHeight = RtStyle.FieldHeight, ToolTip = path } ), 1 );
+
+		var slotRow = RtStyle.FieldRow( card, card.Layout, "Replace", caption );
+		var combo = slotRow.Add( RtStyle.Field( new ComboBox( card ) ), 1 );
+		if ( suggestion is not null )
+			slotRow.Add( new RtPill( card, "SUGGESTED", Theme.Green,
+				$"Suggested from {suggestion.Basis}: {suggestion.Family} {suggestion.Direction}. You can pick another slot." ) );
+
+		var note = card.Layout.Add( new Label( card ) { WordWrap = true } );
+		void ShowNote( StockAnimationSlot slot )
+		{
+			note.Text = slot?.Warning ?? "Choose which stock animation to replace.";
+			note.SetStyles( $"color: {(slot?.Warning is { Length: > 0 } ? Theme.Yellow : Theme.TextLight).Hex}; font-size: 11px;" );
+		}
+
+		card.Layout.Add( new RtSection( card, "What happens" ) );
+		card.Layout.Add( RtStyle.Muted( new Label( card )
+		{
+			Text = "Needs a compatible Citizen armature. The clip is retargeted in place with the slot's loop setting into an "
+				+ "editable, project-owned copy of the graph; stock helper and CopyPinky constraints are kept. Mirrored and additive variants are not made.",
+			WordWrap = true,
+		}, small: true ) );
+
+		dialog.Layout.AddStretchCell();
+		var buttons = dialog.Layout.AddRow();
+		buttons.Spacing = 8;
+		buttons.AddStretchCell();
+		buttons.Add( new RtButton( dialog, "Cancel", null, dialog.Close, "Close without changing anything", 28 ) );
+		var apply = buttons.Add( new Button.Primary( "Retarget and replace" ) { Icon = "swap_horiz", Tint = Theme.Green, FixedHeight = 28, Enabled = selected is not null } );
+
+		combo.AddItem( "Choose a stock slot…", null, () => { selected = null; apply.Enabled = false; ShowNote( null ); }, selected: selected is null );
 		foreach ( var slot in StockAnimationGraph.Slots )
-			combo.AddItem( slot.Label, null, () => { selected = slot; note.Text = slot.Warning; apply.Enabled = true; }, selected: slot == selected );
-		dialog.Layout.Add( new Label( dialog ) { WordWrap = true, Text =
-			(suggestion is null ? "No confident direction suggestion. " : $"Suggested from {suggestion.Basis}: {suggestion.Direction}. You can override this. ")
-			+ "Requires a compatible Citizen armature. Uses an editable project-owned graph copy and keeps stock helper/CopyPinky constraints. The clip is made in-place with the slot's loop setting; variants are not generated." } );
+			combo.AddItem( slot.Label, null, () => { selected = slot; apply.Enabled = true; ShowNote( slot ); }, selected: slot == selected );
+		ShowNote( selected );
 		apply.Clicked = () => { var slot = selected; dialog.Close(); _ = ReplaceStockAsync( take, slot, path ); };
+		dialog.Window.AdjustSize();
 		dialog.Show();
 	}
 
@@ -1621,149 +1744,161 @@ public sealed class RetargetWindow : Widget
 		finally { _converting = false; RefreshCitizenSetupButton(); _convertButton.Enabled = _entries.Any( e => e.Scene is not null ); }
 	}
 
-	/// <summary>One take row (or a file-level row for unreadable files): status icon, label
-	/// ("file.fbx · TakeName" for multi-take files), profile chip (green/amber/red, file
-	/// level — the mapping is per file), and Mapping/Preview/Remove actions. Preview and
-	/// conversion act on THIS take only.</summary>
-	sealed class FileRow : Widget
+	/// <summary>
+	/// One clip row (or a file-level row for unreadable files): a status light; the clip name
+	/// over its file, length and rate; the rig pill (per file — the mapping is per file); a
+	/// Preview button and icon actions. Double-clicking the row previews it too.
+	/// </summary>
+	sealed class ClipRow : Widget
 	{
 		readonly RetargetWindow _window;
 		readonly SourceFileEntry _entry;
 		readonly SourceTakeEntry _take; // null only for unreadable (takeless) files
 
-		public FileRow( RetargetWindow window, SourceFileEntry entry, SourceTakeEntry take ) : base( window )
+		const float PillColumn = 132f;
+		readonly bool _dismissable;
+		bool _pressed;
+
+		public ClipRow( RetargetWindow window, SourceFileEntry entry, SourceTakeEntry take ) : base( window )
 		{
 			_window = window;
 			_entry = entry;
 			_take = take;
 
-			FixedHeight = 34;
+			FixedHeight = 46;
+			MouseTracking = true;
 			Layout = Layout.Row();
-			Layout.Margin = new Sandbox.UI.Margin( 32, 4, 8, 4 ); // left margin = status icon space
-			Layout.Spacing = 8;
+			Layout.Margin = new Sandbox.UI.Margin( 34, 5, 6, 5 ); // left margin = status light
+			Layout.Spacing = 6;
 
 			var detailText = take?.StatusDetail is { Length: > 0 } takeDetail ? takeDetail : entry.StatusDetail;
+			var suggestion = take?.SuggestLocomotion();
+			var failed = Status() is EntryStatus.Failed && detailText.Length > 0;
+			// A file that could not be read has nothing to convert: clicking its row removes it.
+			_dismissable = Status() is EntryStatus.Failed;
+			if ( _dismissable )
+				Cursor = CursorShape.Finger;
 
-			var name = Layout.Add( new Label( this ) { Text = take?.DisplayName ?? entry.FileName } );
-			name.SetStyles( "font-weight: 600;" );
-			name.ToolTip = entry.FilePath + (detailText.Length > 0 ? "\n" + detailText : "");
-
-			Layout.Add( new Chip( this, entry.ChipText, ToneColor( entry.Tone ) ) );
-
-			if ( take is not null && entry.Takes.Count > 1 )
+			// Name over details.
+			var text = Layout.AddColumn( 1 );
+			text.Spacing = 1;
+			// Elided lines: a long name or error message is cut short with "…" (full text in the
+			// tooltip) instead of widening the row past the list and cutting off its buttons.
+			var name = text.Add( new RtElidedLabel( this, 9, 600 )
 			{
-				var takeLabel = Layout.Add( new Label( this )
-				{
-					// rows are the ANIMATIONS; this secondary label says which file they came from
-					Text = $"{entry.FileName} · {take.TakeIndex + 1}/{entry.ClipCount}",
-				} );
-				takeLabel.SetStyles( $"color: {Theme.TextLight.Hex};" );
-			}
-
-			if ( detailText.Length > 0 && Status() is EntryStatus.Failed )
+				Text = (take?.DisplayName ?? entry.FileName) + (suggestion is null ? "" : " · " + suggestion.Direction),
+				ToolTip = entry.FilePath + (detailText.Length > 0 ? "\n" + detailText : ""),
+			} );
+			text.Add( new RtElidedLabel( this, 8 )
 			{
-				var detail = Layout.Add( new Label( this ) { Text = detailText }, 1 );
-				detail.SetStyles( $"color: {Theme.Red.Hex};" );
-			}
+				Text = failed ? "Click to remove  ·  " + detailText : Details(),
+				Color = failed ? Theme.Red : Theme.TextLight,
+				ToolTip = detailText,
+			} );
 
-			Layout.AddStretchCell();
+			// Rig pill, right-aligned in a fixed column so the pills line up down the list.
+			var pillCell = Layout.Add( new Widget( this ) { FixedWidth = PillColumn } );
+			pillCell.Layout = Layout.Row();
+			pillCell.Layout.AddStretchCell();
+			pillCell.Layout.Add( new RtPill( pillCell, entry.ChipText, RtStyle.Tone( entry.Tone ), "Detected rig · mapping confidence" ) );
 
-			// Animation without a resolvable companion skeleton: offer an explicit .dff
-			// or ANT joint-table selection (see SourceFileEntry.ResolveSkeletonFile).
+			var canPreview = entry.Scene is not null && take is not null;
+			var preview = Layout.Add( new RtButton( this, "Preview", "play_arrow", () => _window.OpenPreview( take ),
+				"Solve and preview this clip on the character before converting" ) );
+			preview.Enabled = canPreview;
+
+			// Animation without a resolvable companion skeleton: offer an explicit .dff or ANT
+			// joint-table selection (see SourceFileEntry.ResolveSkeletonFile).
 			if ( entry.NeedsSkeletonFile )
 			{
-				var pickSkeleton = Layout.Add( new Button( "Pick skeleton…", "accessibility" ) );
-				pickSkeleton.ToolTip = SourceFileEntry.IsAntAnimation( entry.FilePath )
-					? "EA ANT animations carry joint indices only — select the ordered joint-table JSON"
-					: "RenderWare animations carry no skeleton — select the character's model .dff";
-				pickSkeleton.Clicked = () => _window.PickSkeletonFor( entry );
+				Layout.Add( RtStyle.Icon( this, "accessibility", () => _window.PickSkeletonFor( entry ),
+					SourceFileEntry.IsAntAnimation( entry.FilePath )
+						? "Pick skeleton: EA ANT animations carry joint indices only — select the ordered joint-table JSON"
+						: "Pick skeleton: RenderWare animations carry no skeleton — select the character's model .dff" ) );
 			}
 
-			if ( entry.Scene is not null && take is not null )
-			{
-				var mapping = Layout.Add( new Button( "Mapping…", "device_hub" ) );
-				mapping.ToolTip = entry.Takes.Count > 1
-					? "Review / edit the bone mapping (shared by every take of this file)"
-					: "Review / edit the bone mapping";
-				mapping.Clicked = () => _window.OpenMappingEditor( entry );
+			var mapping = Layout.Add( RtStyle.Icon( this, "device_hub", () => _window.OpenMappingEditor( entry ),
+				entry.Takes.Count > 1 ? "Bone mapping (shared by every take of this file)" : "Bone mapping" ) );
+			mapping.Enabled = canPreview;
+			var replace = Layout.Add( RtStyle.Icon( this, "swap_horiz", () => _window.OpenStockReplacement( take ),
+				suggestion is null ? "Replace a stock animation: choose an Idle, Walk, Run or Jump slot in a copied Citizen graph"
+					: $"Replace a stock animation. Suggested: {suggestion.Family} {suggestion.Direction} ({suggestion.Basis})." ) );
+			replace.Enabled = canPreview;
+			Layout.Add( RtStyle.Icon( this, "close", Remove, take is not null && entry.Takes.Count > 1 ? "Remove this take from the list" : "Remove from the list" ) );
+		}
 
-				var preview = Layout.Add( new Button( "Preview…", "preview" ) );
-				preview.ToolTip = "Solve and preview this take on the target before converting";
-				preview.Clicked = () => _window.OpenPreview( take );
-				var replace = Layout.Add( new Button( "Replace stock…", "swap_horiz" ) );
-				var suggestion = take.SuggestLocomotion();
-				replace.ToolTip = suggestion is null ? "Choose an Idle, Walk, Run or Jump slot in a copied Citizen graph."
-					: $"Suggested: {suggestion.Family} {suggestion.Direction} ({suggestion.Basis}). Click to review and confirm.";
-				if ( suggestion is not null ) name.Text += " · " + suggestion.Direction;
-				replace.Clicked = () => _window.OpenStockReplacement( take );
+		/// <summary>"file.fbx · take 2 of 5 · 1.2 s · 30 fps".</summary>
+		string Details()
+		{
+			var parts = new List<string> { _entry.FileName };
+			if ( _take is not null && _entry.Takes.Count > 1 )
+				parts.Add( $"take {_take.TakeIndex + 1} of {_entry.ClipCount}" );
+			var clips = _entry.Scene?.Clips;
+			if ( _take is not null && clips is { Count: > 0 } && _entry.ClipDefinitions is null )
+			{
+				var clip = clips[Math.Clamp( _take.TakeIndex, 0, clips.Count - 1 )];
+				parts.Add( $"{clip.Duration:0.0#} s" );
+				parts.Add( $"{clip.Fps:0} fps" );
 			}
-
-			var remove = Layout.Add( new IconButton( "close" ) );
-			remove.ToolTip = take is not null && entry.Takes.Count > 1
-				? "Remove this take from the list"
-				: "Remove from the list";
-			remove.OnClick = () =>
-			{
-				if ( take is not null )
-					_window.RemoveTake( take );
-				else
-					_window.RemoveEntry( entry );
-			};
+			return string.Join( "  ·  ", parts );
 		}
 
 		EntryStatus Status() => _take?.EffectiveStatus ?? _entry.Status;
 
-		static Color ToneColor( ChipTone tone ) => tone switch
+		(string Icon, Color Color, string Tip) StatusIcon() => Status() switch
 		{
-			ChipTone.Green => Theme.Green,
-			ChipTone.Amber => Theme.Yellow,
-			_ => Theme.Red,
+			EntryStatus.Ready => ("check_circle", Theme.Green, "Ready to convert"),
+			EntryStatus.NeedsReview => ("warning", Theme.Yellow, "Check the bone mapping before converting"),
+			EntryStatus.Converting => ("sync", Theme.Blue, "Converting…"),
+			EntryStatus.Converted => ("task_alt", Theme.Green, "Converted"),
+			_ => ("error", Theme.Red, "Failed: click the row to remove it"),
 		};
 
-		(string Icon, Color Color) StatusIcon() => Status() switch
+		protected override void OnMouseEnter() => Update();
+		protected override void OnMouseLeave() => Update();
+
+		protected override void OnMousePress( MouseEvent e )
 		{
-			EntryStatus.Ready => ("check_circle", Theme.Green),
-			EntryStatus.NeedsReview => ("warning", Theme.Yellow),
-			EntryStatus.Converting => ("sync", Theme.Blue),
-			EntryStatus.Converted => ("task_alt", Theme.Green),
-			_ => ("error", Theme.Red),
-		};
+			base.OnMousePress( e );
+			_pressed = true;
+		}
+
+		protected override void OnMouseClick( MouseEvent e )
+		{
+			base.OnMouseClick( e );
+			if ( _dismissable && e.LeftMouseButton )
+				Remove();
+		}
+
+		void Remove()
+		{
+			if ( _take is not null )
+				_window.RemoveTake( _take );
+			else
+				_window.RemoveEntry( _entry );
+		}
+
+		protected override void OnDoubleClick( MouseEvent e )
+		{
+			base.OnDoubleClick( e );
+			// Only a double-click that started on this row: removing a row slides the next one
+			// under the cursor, and a quick second click on the remove button used to land
+			// here as a double-click and open that clip's preview.
+			if ( _pressed && Environment.TickCount64 - _window._rowRemovedAt > 800 && _take is not null && _entry.Scene is not null )
+				_window.OpenPreview( _take );
+		}
 
 		protected override void OnPaint()
 		{
-			Paint.ClearPen();
-			Paint.SetBrush( Paint.HasMouseOver ? Theme.ControlBackground.Lighten( 0.3f ) : Theme.ControlBackground );
-			Paint.DrawRect( LocalRect, 4 );
+			Paint.Antialiasing = true;
+			Paint.SetPen( Theme.ControlBackground.Lighten( .4f ), 1 );
+			Paint.SetBrush( Paint.HasMouseOver ? Theme.WindowBackground.Lighten( .35f ) : Theme.WindowBackground );
+			Paint.DrawRect( LocalRect.Shrink( .5f ), 5 );
 
-			var (icon, color) = StatusIcon();
+			var (icon, color, tip) = StatusIcon();
+			ToolTip = tip;
 			Paint.SetPen( color );
-			Paint.DrawIcon( new Rect( 8, (Height - 18) * 0.5f, 18, 18 ), icon, 16 );
-		}
-	}
-
-	/// <summary>Rounded status pill, e.g. <c>mixamo · 100%</c> in the tone color.</summary>
-	sealed class Chip : Widget
-	{
-		readonly string _text;
-		readonly Color _color;
-
-		public Chip( Widget parent, string text, Color color ) : base( parent )
-		{
-			_text = text;
-			_color = color;
-			FixedHeight = 20;
-			FixedWidth = 7.2f * text.Length + 18;
-			ToolTip = "Profile · mapping confidence";
-		}
-
-		protected override void OnPaint()
-		{
-			Paint.ClearPen();
-			Paint.SetBrush( _color.WithAlpha( 0.18f ) );
-			Paint.DrawRect( LocalRect, LocalRect.Height * 0.5f );
-			Paint.SetPen( _color );
-			Paint.SetDefaultFont( 7, 600 );
-			Paint.DrawText( LocalRect, _text );
+			Paint.DrawIcon( new Rect( 9, (Height - 18) * 0.5f, 18, 18 ), icon, 17 );
 		}
 	}
 }

@@ -61,6 +61,29 @@ public sealed class PreviewWidget : SceneRenderingWidget
 	float _yaw = 35f;
 	Vector2 _lastMouse;
 
+	// ---- interactive camera (defaults reproduce the fixed 3/4 framing exactly) -----------
+	const float DefaultYaw = 35f;
+	static readonly float DefaultPitch = MathF.Atan( 0.35f ) * 180f / MathF.PI;
+	float _pitch = DefaultPitch;
+	float _zoom = 1f;
+	Vector3 _pan;
+
+	// ---- ground check (opt-in: the window shows it; headless gate renders stay unchanged) --
+	int[] _footBones = Array.Empty<int>();
+	int[] _soleBones = Array.Empty<int>();
+	float _restFootZ;
+	// Per foot: every bone of the foot (ankle, ball, toes, tips) and its lowest height at rest.
+	int[][] _sideBones = Array.Empty<int[]>();
+	// Per foot: contact points carried by a bone (local offset) - the joints themselves plus a
+	// heel under the ankle and a toe tip ahead of the ball, both at floor height in the rest
+	// pose. A heel strike lifts every joint but the heel; a toe-off, every joint but the tip.
+	(int Bone, Vector3 Local)[][] _sideContacts = Array.Empty<(int, Vector3)[]>();
+	float[] _sideRestZ = Array.Empty<float>();
+	float[] _sideClearance = Array.Empty<float>();
+	float _groundZ;
+	float _characterHeight = 72f;
+	XForm[] _clearanceScratch;
+
 	// ---- target skeleton wireframe (the RETARGETED pose as stick skeleton) --------------
 	// One SceneLineObject per skeleton CHAIN: the object holds a single polyline (every
 	// StartLine restarts it - per-bone Start/End cycles left only the last segment on
@@ -227,8 +250,8 @@ public sealed class PreviewWidget : SceneRenderingWidget
 			_skeletonOnly = value;
 			if ( _sceneModel.IsValid() )
 				_sceneModel.RenderingEnabled = !SkeletonOnly;
-			foreach ( var chain in _skeletonChainObjects )
-				chain.RenderingEnabled = SkeletonOnly;
+			if ( _boneModel.IsValid() )
+				_boneModel.RenderingEnabled = SkeletonOnly;
 		}
 	}
 
@@ -307,6 +330,160 @@ public sealed class PreviewWidget : SceneRenderingWidget
 		var restBounds = ComputeRestBounds();
 		_skeletonCenter = restBounds.Center;
 		_skeletonRadius = MathF.Max( restBounds.Size.Length * 0.5f, 8f );
+		_restCenterZ = restBounds.Center.z;
+		SetUpGround( restBounds );
+	}
+
+	/// <summary>Draws a floor grid at the character's ground and a feet read-out, so hovering
+	/// or sinking is visible at a glance. Off by default (the UI smoke gate renders without it).</summary>
+	public bool ShowGround { get; set; }
+
+	/// <summary>Lowest foot joint above (+) or below (−) where it stands in the rest pose, in
+	/// engine units, for the pose on screen. Null when the rig has no mapped feet.</summary>
+	public float? FootClearance { get; private set; }
+
+	/// <summary>Contact tolerance for the whole-clip verdict: about an inch on a Citizen-sized
+	/// character. A clip whose feet never get this close to the floor floats.</summary>
+	public float ContactTolerance => MathF.Max( 0.4f, _characterHeight * 0.015f );
+
+	/// <summary>Tolerance for a single frame: about 3 in on a human. The heel and toe tip are
+	/// estimated, so a planted foot rolling through a step can read a couple of inches; real
+	/// flight (runs, jumps) clears this easily. Hovering clips are caught by the whole-clip verdict.</summary>
+	public float FrameContactTolerance => MathF.Max( 1f, _characterHeight * 0.04f );
+
+	/// <summary>Whole-clip ground verdict, measured over every solved frame when a clip is set:
+	/// the lowest the feet get relative to standing. Above the tolerance the character never
+	/// touches the floor (floats); below it the feet sink through it.</summary>
+	public float? ClipClearance { get; private set; }
+
+	/// <summary>The feet are the character's contact with the floor: foot and toe bones.
+	/// Their rest-pose height is "standing"; the floor is the mesh's lowest point at bind.</summary>
+	void SetUpGround( BBox restBounds )
+	{
+		// A foot touches the floor with whichever of its joints is lowest - the heel lifts the
+		// ankle while the ball and toes stay down - so each foot is its whole bone tree.
+		var skeleton = _rig.Skeleton;
+		var sides = new List<int[]>();
+		var soles = new List<int>();
+		foreach ( var (foot, toe) in new[] { (BoneRole.FootL, BoneRole.ToeL), (BoneRole.FootR, BoneRole.ToeR) } )
+		{
+			if ( _rig.BoneForRole( foot ) is not { } root )
+				continue;
+			var bones = new HashSet<int> { root };
+			if ( _rig.BoneForRole( toe ) is { } toeBone )
+				bones.Add( toeBone );
+			for ( var i = 0; i < skeleton.Count; i++ )
+			{
+				for ( var p = skeleton[i].ParentIndex; p >= 0; p = skeleton[p].ParentIndex )
+				{
+					if ( p == root )
+					{
+						bones.Add( i );
+						break;
+					}
+				}
+			}
+			sides.Add( bones.ToArray() );
+			soles.Add( root );
+		}
+		_sideBones = sides.ToArray();
+		_soleBones = soles.ToArray();
+		_footBones = sides.SelectMany( b => b ).ToArray();
+		_sideContacts = new (int, Vector3)[_sideBones.Length][];
+		for ( var side = 0; side < _sideBones.Length; side++ )
+		{
+			var bones = _sideBones[side];
+			var rest = bones.ToDictionary( i => i, i => RigWorldToEngine( skeleton.RestWorld[i] ) );
+			var floor = rest.Values.Min( t => t.Position.z );
+			var ankle = rest[soles[side]];
+			var contacts = bones.Select( i => (i, Vector3.Zero) ).ToList();
+			// Heel: straight under the ankle, on the floor.
+			contacts.Add( (soles[side], ankle.PointToLocal( ankle.Position.WithZ( floor ) )) );
+			// Toe tip: past the farthest foot joint, half the ankle-to-toe reach again, on the floor.
+			var tipBone = bones.OrderByDescending( i => (rest[i].Position - ankle.Position).WithZ( 0 ).Length ).First();
+			var reach = (rest[tipBone].Position - ankle.Position).WithZ( 0 );
+			if ( tipBone != soles[side] && reach.Length > 0.01f )
+			{
+				var tip = (rest[tipBone].Position + reach * 0.5f).WithZ( floor );
+				contacts.Add( (tipBone, rest[tipBone].PointToLocal( tip )) );
+			}
+			_sideContacts[side] = contacts.ToArray();
+		}
+		_sideRestZ = _sideContacts.Select( contacts => contacts.Min( c => RigWorldToEngine( skeleton.RestWorld[c.Bone] ).PointToWorld( c.Local ).z ) ).ToArray();
+		_sideClearance = new float[_sideBones.Length];
+		_clearanceScratch = new XForm[_rig.Skeleton.Count];
+		_characterHeight = MathF.Max( restBounds.Size.z, 8f );
+		_restFootZ = _sideRestZ.Length > 0 ? _sideRestZ.Min() : restBounds.Mins.z;
+		_groundZ = _restFootZ;
+		if ( _sceneModel.IsValid() )
+		{
+			// The mesh sole sits a little under the foot joints; use it when it is plausible.
+			var sole = _sceneModel.Model.Bounds.Mins.z;
+			if ( sole <= _restFootZ && _restFootZ - sole < _characterHeight * 0.2f )
+				_groundZ = sole;
+		}
+	}
+
+	/// <summary>How far the lower foot is above (+) or below (−) where it stands at rest, for
+	/// one FK'd pose; each foot is measured by its lowest joint. Fills the per-foot values.</summary>
+	float? MeasureClearance( XForm[] world, int count )
+	{
+		if ( _sideBones.Length == 0 )
+			return null;
+		var lowest = float.MaxValue;
+		for ( var side = 0; side < _sideBones.Length; side++ )
+		{
+			var z = float.MaxValue;
+			foreach ( var (bone, local) in _sideContacts[side] )
+			{
+				if ( bone < count )
+					z = MathF.Min( z, RigWorldToEngine( world[bone] ).PointToWorld( local ).z );
+			}
+			if ( z == float.MaxValue )
+				continue;
+			_sideClearance[side] = z - _sideRestZ[side];
+			lowest = MathF.Min( lowest, _sideClearance[side] );
+		}
+		return lowest == float.MaxValue ? null : lowest;
+	}
+
+	void MeasureClipClearance()
+	{
+		ClipClearance = null;
+		if ( _clip?.SolvedFrames is not { Count: > 0 } frames || _footBones.Length == 0 )
+			return;
+		var skeleton = _rig.Skeleton;
+		var lowest = float.MaxValue;
+		foreach ( var frame in frames )
+		{
+			var count = Math.Min( frame.Length, skeleton.Count );
+			for ( var i = 0; i < count; i++ )
+			{
+				var parent = skeleton[i].ParentIndex;
+				_clearanceScratch[i] = parent < 0 ? frame[i] : XForm.Compose( _clearanceScratch[parent], frame[i] );
+			}
+			if ( MeasureClearance( _clearanceScratch, count ) is { } clearance )
+				lowest = MathF.Min( lowest, clearance );
+		}
+		if ( lowest != float.MaxValue )
+			ClipClearance = lowest;
+	}
+
+	/// <summary>Resets orbit, pitch, zoom and pan to the default 3/4 framing.</summary>
+	public void ResetView()
+	{
+		_yaw = DefaultYaw;
+		_pitch = DefaultPitch;
+		_zoom = 1f;
+		_pan = Vector3.Zero;
+	}
+
+	/// <summary>Named camera angles: yaw around the character and elevation, framing kept.</summary>
+	public void SetView( float yaw, float pitch )
+	{
+		_yaw = yaw;
+		_pitch = Math.Clamp( pitch, -10f, 80f );
+		_pan = Vector3.Zero;
 	}
 
 	int[] _cameraBones;
@@ -330,6 +507,7 @@ public sealed class PreviewWidget : SceneRenderingWidget
 		_time = 0;
 		CurrentFrame = 0;
 		_ghostAlignedClip = null; // ghost anchor depends on this clip's frame 0 - recompute
+		MeasureClipClearance();
 	}
 
 	/// <summary>Jumps to a frame (scrubber); pauses playback.</summary>
@@ -373,6 +551,8 @@ public sealed class PreviewWidget : SceneRenderingWidget
 	{
 		Scene.EditorTick( RealTime.Now, RealTime.Delta );
 		UpdateCamera();
+		if ( ShowGround )
+			DrawGround();
 
 		if ( _clip?.SolvedFrames is not { Count: > 0 } frames )
 			return;
@@ -445,6 +625,7 @@ public sealed class PreviewWidget : SceneRenderingWidget
 			var parent = skeleton[i].ParentIndex;
 			_worldScratch[i] = parent < 0 ? locals[i] : XForm.Compose( _worldScratch[parent], locals[i] );
 		}
+		FootClearance = MeasureClearance( _worldScratch, count );
 
 		if ( _sceneModel.IsValid() )
 		{
@@ -477,15 +658,12 @@ public sealed class PreviewWidget : SceneRenderingWidget
 	/// anchor with the posed bounds (fixed rest-pose zoom so it doesn't pulse).</summary>
 	void UpdateSkeletonLines( int count )
 	{
-		_skeletonChains ??= BuildChains( i => _rig.Skeleton[i].ParentIndex, _rig.Skeleton.Count );
-		EnsureChainObjects( _skeletonChainObjects, _skeletonChains.Length );
-		foreach ( var chain in _skeletonChainObjects )
-			chain.RenderingEnabled = SkeletonOnly;
+		if ( _boneModel.IsValid() )
+			_boneModel.RenderingEnabled = SkeletonOnly;
 		if ( !SkeletonOnly )
 			return;
 
 		SkeletonLineCount = 0;
-		var boneWidth = OverlayLineWidth;
 		// Culling bounds cover EVERYTHING drawn; the camera center tracks only the
 		// mapped character bones (stray far-away FBX nodes must not drag it off).
 		var min = new Vector3( float.MaxValue );
@@ -501,27 +679,15 @@ public sealed class PreviewWidget : SceneRenderingWidget
 			cameraMax = Vector3.Max( cameraMax, cameraPos );
 		}
 
-		var engine = new Vector3[count];
+		var engine = new Transform[count];
 		for ( var i = 0; i < count; i++ )
 		{
-			engine[i] = RigWorldToEngine( _worldScratch[i] ).Position;
-			min = Vector3.Min( min, engine[i] );
-			max = Vector3.Max( max, engine[i] );
+			engine[i] = RigWorldToEngine( _worldScratch[i] );
+			min = Vector3.Min( min, engine[i].Position );
+			max = Vector3.Max( max, engine[i].Position );
 		}
-
-		var points = new List<Vector3>();
-		for ( var c = 0; c < _skeletonChains.Length; c++ )
-		{
-			points.Clear();
-			foreach ( var index in _skeletonChains[c] )
-			{
-				if ( index < count )
-					points.Add( engine[index] );
-			}
-			DrawChain( _skeletonChainObjects[c], points, SkeletonBoneColor, boneWidth );
-			FitBounds( _skeletonChainObjects[c], min, max );
-			SkeletonLineCount += Math.Max( points.Count - 1, 0 );
-		}
+		UpdateBoneMesh( engine, count );
+		var boneWidth = 0f;
 
 		if ( count > 0 )
 		{
@@ -529,8 +695,150 @@ public sealed class PreviewWidget : SceneRenderingWidget
 				_skeletonCenter = (cameraMin + cameraMax) * 0.5f;
 			SkeletonDebug = $"drawn=[{min} .. {max}] cam=[{cameraMin} .. {cameraMax}] "
 				+ $"center={_skeletonCenter} radius={_skeletonRadius:0.#} width={boneWidth:0.##} "
-				+ $"count={count} chains={_skeletonChains.Length}";
+				+ $"count={count} bones={SkeletonLineCount}";
 		}
+	}
+
+	// ---- Blender-style octahedral bones (the skeleton view) ---------------------------------
+	// A bone runs from its parent joint to its own joint: a narrow double pyramid whose widest
+	// square section sits at 10% of the length and is 10% of the length across, drawn solid
+	// gray like Blender's default bones. One mesh holds every bone; it is rewritten in place
+	// each frame.
+	// Head joint, tail joint (-1: an end bone extended past Head, away from Before).
+	(int From, int To, int Before)[] _boneSegments;
+	Mesh _boneMesh;
+	SceneModel _boneModel;
+	List<Vertex> _boneVertices;
+
+	static readonly Color BoneGray = new( 0.62f, 0.62f, 0.62f );
+	static readonly int[] BoneTriangles = { 0, 1, 2, 0, 2, 3, 0, 3, 4, 0, 4, 1, 5, 2, 1, 5, 3, 2, 5, 4, 3, 5, 1, 4 };
+
+	/// <summary>The body's bones, like a deform rig in Blender: each mapped joint (hips, spine,
+	/// limbs, fingers, head) joins its nearest mapped ancestor, so twist helpers and IK targets
+	/// don't add stray wedges; end joints (head, toes, finger tips) get a short tail bone. Rigs
+	/// with too few mapped joints draw every bone.</summary>
+	(int, int, int)[] BuildBoneSegments()
+	{
+		var skeleton = _rig.Skeleton;
+		var mapped = new HashSet<int>();
+		foreach ( var role in Enum.GetValues<BoneRole>() )
+		{
+			if ( _rig.BoneForRole( role ) is { } index )
+				mapped.Add( index );
+		}
+		if ( mapped.Count < 6 )
+		{
+			return Enumerable.Range( 0, skeleton.Count ).Where( i => skeleton[i].ParentIndex >= 0 )
+				.Select( i => (skeleton[i].ParentIndex, i, -1) ).ToArray();
+		}
+
+		int MappedAncestor( int bone )
+		{
+			for ( var p = skeleton[bone].ParentIndex; p >= 0; p = skeleton[p].ParentIndex )
+			{
+				if ( mapped.Contains( p ) )
+					return p;
+			}
+			return -1;
+		}
+
+		var segments = new List<(int, int, int)>();
+		var hasChild = new HashSet<int>();
+		foreach ( var bone in mapped )
+		{
+			var parent = MappedAncestor( bone );
+			if ( parent < 0 )
+				continue;
+			segments.Add( (parent, bone, -1) );
+			hasChild.Add( parent );
+		}
+		foreach ( var bone in mapped )
+		{
+			if ( !hasChild.Contains( bone ) && MappedAncestor( bone ) is var before and >= 0 )
+				segments.Add( (bone, -1, before) );
+		}
+		return segments.ToArray();
+	}
+
+	void UpdateBoneMesh( Transform[] engine, int count )
+	{
+		var skeleton = _rig.Skeleton;
+		_boneSegments ??= BuildBoneSegments();
+		var vertexCount = _boneSegments.Length * BoneTriangles.Length;
+		_boneVertices ??= new List<Vertex>( vertexCount );
+		_boneVertices.Clear();
+
+		// Real bones are never longer than most of the character; longer segments lead to
+		// stray exporter nodes far from the body and are left out.
+		var longest = _characterHeight * 0.75f;
+		var min = new Vector3( float.MaxValue );
+		var max = new Vector3( float.MinValue );
+		var points = new Vector3[6];
+		foreach ( var (from, to, before) in _boneSegments )
+		{
+			var drawn = from < count && (to < 0 ? before >= 0 && before < count : to < count);
+			var head = drawn ? engine[from].Position : Vector3.Zero;
+			var tail = !drawn ? Vector3.Zero
+				: to >= 0 ? engine[to].Position
+				: head + (head - engine[before].Position) * 0.5f;
+			var axis = tail - head;
+			var length = axis.Length;
+			if ( !drawn || length < 0.01f || length > longest )
+			{
+				// Keep the vertex count fixed: a degenerate bone draws nothing.
+				for ( var t = 0; t < BoneTriangles.Length; t++ )
+					_boneVertices.Add( new Vertex( head, Vector3.Up, new Vector4( 1, 0, 0, 1 ), Vector2.Zero ) { Color = BoneGray } );
+				continue;
+			}
+			axis /= length;
+			var up = engine[from].Rotation.Up;
+			if ( MathF.Abs( Vector3.Dot( up, axis ) ) > 0.95f )
+				up = MathF.Abs( axis.z ) < 0.9f ? Vector3.Up : Vector3.Forward;
+			var side = Vector3.Cross( axis, up ).Normal;
+			up = Vector3.Cross( side, axis );
+			var ring = head + axis * (length * 0.1f);
+			var width = length * 0.1f;
+			points[0] = head;
+			points[1] = ring + (side + up) * width;
+			points[2] = ring + (side - up) * width;
+			points[3] = ring + (-side - up) * width;
+			points[4] = ring + (-side + up) * width;
+			points[5] = tail;
+			var center = head + axis * (length * 0.3f);
+			for ( var t = 0; t < BoneTriangles.Length; t += 3 )
+			{
+				var a = points[BoneTriangles[t]];
+				var b = points[BoneTriangles[t + 1]];
+				var c = points[BoneTriangles[t + 2]];
+				var normal = Vector3.Cross( b - a, c - a ).Normal;
+				// Wind every face outward so the solid material never culls it.
+				if ( Vector3.Dot( normal, (a + b + c) / 3f - center ) < 0 )
+				{
+					(b, c) = (c, b);
+					normal = -normal;
+				}
+				var shade = BoneGray * (0.7f + 0.3f * MathF.Abs( normal.z ));
+				foreach ( var p in new[] { a, b, c } )
+					_boneVertices.Add( new Vertex( p, normal, new Vector4( 1, 0, 0, 1 ), Vector2.Zero ) { Color = shade.WithAlpha( 1f ) } );
+			}
+			min = Vector3.Min( min, Vector3.Min( head, tail ) - width );
+			max = Vector3.Max( max, Vector3.Max( head, tail ) + width );
+			SkeletonLineCount++;
+		}
+
+		if ( _boneMesh is null )
+		{
+			_boneMesh = new Mesh( Material.Load( "materials/gizmo/solid.vmat" ) );
+			_boneMesh.CreateVertexBuffer( _boneVertices.Count, _boneVertices );
+			_boneMesh.CreateIndexBuffer( _boneVertices.Count, Enumerable.Range( 0, _boneVertices.Count ).ToArray() );
+		}
+		else
+			_boneMesh.SetVertexBufferData( _boneVertices );
+		if ( min.x <= max.x )
+			_boneMesh.Bounds = new BBox( min, max );
+		if ( !_boneModel.IsValid() )
+			_boneModel = new SceneModel( Scene.SceneWorld, Model.Builder.AddMesh( _boneMesh ).Create(), Transform.Zero );
+		_boneModel.RenderingEnabled = SkeletonOnly;
 	}
 
 	/// <summary>
@@ -1027,24 +1335,119 @@ public sealed class PreviewWidget : SceneRenderingWidget
 		// for model-less targets) the same policy runs off the FK'd skeleton instead.
 		var useModelBounds = _sceneModel.IsValid() && !SkeletonOnly;
 		var center = useModelBounds ? _sceneModel.Bounds.Center : _skeletonCenter;
+		if ( SmoothCamera )
+		{
+			// Follow the character's travel, not its bob and sway: ease towards where it is
+			// (about half a second behind) at a fixed height.
+			var goal = new Vector3( center.x, center.y, _restCenterZ );
+			_followCenter = _followCenter is { } current
+				? Vector3.Lerp( current, goal, 1f - MathF.Exp( -RealTime.Delta / 0.35f ) )
+				: goal;
+			center = _followCenter.Value;
+		}
 		var radius = useModelBounds
 			? MathF.Max( _sceneModel.Model.Bounds.Size.Length * 0.5f, 8f )
 			: _skeletonRadius;
-		var distance = MathX.SphereCameraDistance( radius, Camera.FieldOfView ) * 1.05f;
+		var distance = MathX.SphereCameraDistance( radius, Camera.FieldOfView ) * 1.05f * _zoom;
 
 		var yawRad = MathX.DegreeToRadian( _yaw );
-		var dir = new Vector3( MathF.Cos( yawRad ), MathF.Sin( yawRad ), 0.35f ).Normal;
-		Camera.WorldPosition = center + dir * distance;
+		var pitchRad = MathX.DegreeToRadian( _pitch );
+		var dir = new Vector3( MathF.Cos( yawRad ) * MathF.Cos( pitchRad ), MathF.Sin( yawRad ) * MathF.Cos( pitchRad ),
+			MathF.Sin( pitchRad ) ).Normal;
+		_viewRadius = radius;
+		Camera.WorldPosition = center + _pan + dir * distance;
 		Camera.WorldRotation = Rotation.LookAt( -dir, Vector3.Up );
 	}
 
+	float _viewRadius = 40f;
+	Vector3? _followCenter;
+	float _restCenterZ;
+
+	/// <summary>Eases the camera after the character instead of re-centering on every frame's
+	/// pose (which shakes with every step). Off by default: headless renders frame each pose exactly.</summary>
+	public bool SmoothCamera { get; set; }
+
+	// Left drag orbits (horizontal) and tilts (vertical); right or middle drag pans; the wheel zooms.
 	protected override void OnMouseMove( MouseEvent e )
 	{
 		base.OnMouseMove( e );
 		var delta = e.LocalPosition - _lastMouse;
 		_lastMouse = e.LocalPosition;
 		if ( (e.ButtonState & MouseButtons.Left) != 0 )
+		{
 			_yaw -= delta.x * 0.4f;
+			_pitch = Math.Clamp( _pitch + delta.y * 0.3f, -10f, 80f );
+		}
+		else if ( (e.ButtonState & (MouseButtons.Right | MouseButtons.Middle)) != 0 && Camera.IsValid() )
+		{
+			var scale = _viewRadius * _zoom * 0.004f;
+			_pan += (Camera.WorldRotation.Left * delta.x + Camera.WorldRotation.Up * delta.y) * scale;
+		}
+	}
+
+	protected override void OnWheel( WheelEvent e )
+	{
+		base.OnWheel( e );
+		_zoom = Math.Clamp( _zoom * (e.Delta > 0 ? 0.9f : 1.1f), 0.25f, 4f );
+		e.Accept();
+	}
+
+	protected override void OnDoubleClick( MouseEvent e )
+	{
+		base.OnDoubleClick( e );
+		ResetView();
+	}
+
+	/// <summary>
+	/// The floor at the character's ground: a grid that fades towards its edges, centered under
+	/// the character, with a line from each foot down to the floor. Lines turn amber while the
+	/// feet are clear of the floor and red when they sink through it.
+	/// </summary>
+	void DrawGround()
+	{
+		var step = MathF.Max( _characterHeight / 6f, 2f );
+		const int cells = 10;
+		var extent = cells * step;
+		var center = _sceneModel.IsValid() && !SkeletonOnly ? _sceneModel.Bounds.Center : _skeletonCenter;
+		// The floor stays put under a walking character; it only re-centers in large blocks
+		// once the character has travelled far across it.
+		if ( _followCenter is { } follow )
+			center = follow;
+		var block = step * 5f;
+		var originX = MathF.Round( center.x / block ) * block;
+		var originY = MathF.Round( center.y / block ) * block;
+
+		using var scope = Gizmo.Scope( "humanoid-retargeter-ground" );
+		Gizmo.Transform = Transform.Zero;
+		Gizmo.Draw.IgnoreDepth = false;
+		Gizmo.Draw.LineThickness = 1f;
+		for ( var i = -cells; i <= cells; i++ )
+		{
+			var fade = 1f - MathF.Abs( i ) / (cells + 1f);
+			Gizmo.Draw.Color = Color.White.WithAlpha( (i == 0 ? .16f : .07f) * fade + .015f );
+			var o = i * step;
+			Gizmo.Draw.Line( new Vector3( originX + o, originY - extent, _groundZ ), new Vector3( originX + o, originY + extent, _groundZ ) );
+			Gizmo.Draw.Line( new Vector3( originX - extent, originY + o, _groundZ ), new Vector3( originX + extent, originY + o, _groundZ ) );
+		}
+
+		if ( FootClearance is null )
+			return;
+		// A ring on the floor under each foot: green while that foot is down, amber while it is
+		// off the floor, red when it sinks through it. Walking shows one of each; floating, two amber.
+		var tolerance = FrameContactTolerance;
+		Gizmo.Draw.IgnoreDepth = true;
+		Gizmo.Draw.LineThickness = 2f;
+		for ( var side = 0; side < _soleBones.Length; side++ )
+		{
+			var index = _soleBones[side];
+			if ( index >= _worldScratch.Length )
+				continue;
+			var clearance = _sideClearance[side];
+			var color = clearance > tolerance ? Theme.Yellow : clearance < -tolerance ? Theme.Red : Theme.Green;
+			var foot = RigWorldToEngine( _worldScratch[index] ).Position;
+			Gizmo.Draw.Color = color.WithAlpha( .85f );
+			Gizmo.Draw.LineCircle( new Vector3( foot.x, foot.y, _groundZ ), Vector3.Up, step * 0.18f, 0, 360, 20 );
+		}
 	}
 
 	public override void OnDestroyed()
